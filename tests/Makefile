@@ -1,0 +1,33 @@
+#
+# This is Makefile for cocotb
+#
+
+SIM ?= verilator
+TOPLEVEL_LANG ?= verilog
+TOPNAME=user_accel_bd_wrapper
+HWMODULENAME=AxiSRV32I
+SRCDIR = $(abspath ../generated/$(HWMODULENAME))
+VERILOG_SOURCES += $(SRCDIR)/*.v $(SRCDIR)/*.sv
+
+WAVES = 1
+EXTRA_ARGS += --trace --trace-structs
+
+TARGETS=loop rlwimieq rlwimi
+
+all:
+	make loop
+
+$(TARGETS) : $(SRCDIR)/$(HWMODULENAME).sv
+	@echo $(VERILOG_SOURCES)
+	@PARAMFN=$(SRCDIR)/params.json $(MAKE) sim MODULE=tb_$@ TOPLEVEL=$(TOPNAME)
+	@echo -e "\n[Output]"
+	@cat output.log
+
+$(SRCDIR)/$(HWMODULENAME).sv gen:
+	(cd ../ ; ./mill runMain xccel.AxiXccel)
+
+include $(shell cocotb-config --makefiles)/Makefile.sim
+
+clean::
+	rm -f output.txt results.xml *.vcd fpga_simple.py
+	rm -rf __pycache__

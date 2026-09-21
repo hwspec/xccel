@@ -1,0 +1,38 @@
+package build
+import mill._
+import mill.scalalib._
+
+val chiselVersion = "7.13.0"
+val scalatestVersion = "3.2.19"
+
+object `package` extends SbtModule {
+  def scalaVersion = "2.13.18"
+
+  def axiUtilsSources = Task.Sources(moduleDir / "chisel-axi-utils" / "src" / "main" / "scala")
+
+  def sources = Task {
+    super.sources() ++ axiUtilsSources()
+  }
+
+  def mvnDeps = Seq(
+    mvn"org.chipsalliance::chisel:$chiselVersion",
+  )
+
+  def scalacOptions = Seq(
+    "-language:reflectiveCalls",
+    "-deprecation",
+    "-feature",
+    "-Xcheckinit",
+    "-Ymacro-annotations",
+  )
+
+  def scalacPluginMvnDeps = Seq(
+    mvn"org.chipsalliance:::chisel-plugin:$chiselVersion",
+  )
+
+  object test extends SbtTests with TestModule.ScalaTest {
+    def mvnDeps = Seq(
+      mvn"org.scalatest::scalatest:$scalatestVersion",
+    )
+  }
+}

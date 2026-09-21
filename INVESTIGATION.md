@@ -148,9 +148,14 @@ We analyzed bottlenecks on actual BraggNN implementation using hardware counters
 | output | 731 | 770 | 778 | 772 | 18 | 1 | 45 |
 | **Total** | **56,319** | **38,047** | **38,501** | **38,222** | **15,840** | **6,239** | **17,067** |
 
+### Others
+
+- PtychoNN encoder takes 785,998 average clock cycles over 10 inference on FireSim baremetal environment (524 us @ 1.5 GHz).
+- Added the data path from the accumulator to the Scratchpad in `gemmini_mvout_spad`
+
 ### Discussin
 
-- The stall at Scratchpad feeding operands in the mesh dominates the large portion of cycles.
+- The stall at Scratchpad feeding operands to the mesh dominates the large portion of cycles.
 - The sum of all `exe_active` in the hardware counters table is 17,067, minimum cycles when we eliminate all memory-bound cycles but don't change compute units and tiling strategies.
 - The fact that most of the M/N/K sizes are not multiple of DIM (=16) makes tiling strategies difficult.
 - Resadd operation takes a large number of DMA cycles
@@ -180,6 +185,8 @@ We analyzed bottlenecks on actual BraggNN implementation using hardware counters
 
 ### a-Matrix
 
+### NVDLA
+
 ### ShiDianNao
 
 ### MAERI
@@ -189,13 +196,13 @@ We analyzed bottlenecks on actual BraggNN implementation using hardware counters
 
 ## Concept of Our Accelerator
 
-Firstly, we shall resolve these partial problems in our design.
+Firstly, we require to solve these partial problems through our design.
 
 - Eliminating DRAM round-trip
 - Eliminating SRAM stalls
 - Designing to fit to both tiny kernels in BraggNN and large convolution with max-pooling in PtychoNN
 
-Here are some features we want
+Here are some features we want.
 
 - Input data are fed from streaming of the censor to the mesh directly via queues
 - Deterministic dataflow
@@ -205,10 +212,47 @@ Here are some features we want
 - Im2col, normalizer, requantizatin units
 - Native residual add support
 
+## XCCEL
+
+XCCEL is a framework for exploring the SRAM design and compute unit in X-ray detector ASICs simulateniously.
+This framework abstracts near-sensor AI accelerators to the input activation buffer, weight buffer, accumulator, compute unit, and instraction decoder, assuming deterministic dataflow such as Groq.
+The user (whichever the human or AI agents) can specify the number of SRAMs and design of each buffer including depth, word length, the number of ports, port bandwidth, mask granularity, and read/write latency.
+Moreover, the user can replace a compute unit with their IP such as systolic array, reduction tree, and vector engine.
+Note that it does never have caches, reservation station, and arbiters inside the accelerator since it adopts deterministic dataflow architecture.
+
+
+### Design Principle
+
+Scheduler view is like 'move data at SRAM address i to compute-unit port j (other SRAM address j)'.
+However, the static connectivity shapes at RTL-level vary.
+
+- 1:1
+  - one bank, one port
+- 1:N
+  - one wide bank feeds several ports
+- N:1
+  - several narrow banks feed one wide port
+- N:M
+  - direct wire, but one bank/port have several wire
+
+On top of this, SRAM port can take several patterns including 1RW, 1R1W, 2RW.
+
+Additionally, dynamic cast modes, including unicast, multicast, and broadcast, should be considered.
+
+- Shift: implemented by a barrel shifter between components (e.g., interface of SRAM and systolic array mesh)
+- Group: how many grains (e.g., SRAM bank ports) correspond to ports (e.g., mesh ports)
+
+### Related Works
+
+
+- A. Parashar et al., "Timeloop: A Systematic Approach to DNN Accelerator Evaluation," 2019 IEEE International Symposium on Performance Analysis of Systems and Software (ISPASS), Madison, WI, USA, 2019, pp. 304-315, doi: 10.1109/ISPASS.2019.00042. keywords
+
+
 
 ## References
 
 <a id="1">[1]</a> 
 H. Ishibe, C. Bohannon, Y. Sato and K. Yoshii, "Evaluating a Programmable DNN Accelerator for On-Chip Bragg Peak Localization in X-ray Detector ASICs: A Case Study and Performance Evaluation," 2026 IEEE Symposium on Low-Power and High-Speed Chips and Systems (COOL CHIPS), Tokyo, Japan, 2026, pp. 1-6, doi: 10.1109/COOLCHIPS68842.2026.11556996.
-<a id="2">[2]</a> 
+
+<a id="2">[2]</a>
 Van Delm, Josse, Anton Lydike, Joren Dumoulin, Jonas Crols, Xiaoling Yi, Ryan Antonio, Jackson Woodruff, Tobias Grosser, and Marian Verhelst. "The Configuration Wall: Characterization and Elimination of Accelerator Configuration Overhead." ArXiv, (2025). Accessed September 17, 2026. https://doi.org/10.1145/3760250.3762225.

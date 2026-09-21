@@ -1,0 +1,3 @@
+[submodule "chisel-axi-utils"]
+	path = chisel-axi-utils
+	url = https://github.com/hwspec/chisel-axi-utils.git
