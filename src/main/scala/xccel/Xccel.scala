@@ -13,6 +13,8 @@ case class XccelConfig(
   maxRunLength: Int,
   requantMultWidth: Int = 16,
   requantParamSets: Int = 1,
+  softmaxStats: Int = 1,
+  residualParamSets: Int = 2,
 ) {
   require(weightBuffer.cu == cu, "weightBuffer must share this Xccel's ComputeUnitConfig")
   require(activationBuffer.cu == cu, "activationBuffer must share this Xccel's ComputeUnitConfig")
@@ -27,8 +29,25 @@ case class XccelConfig(
   // written as zero). Otherwise abWrite.fromRequantizer has no effect.
   val feedback: Boolean =
     requantizedWidth == cu.inputWidth && cu.numOutputs <= activationBuffer.totalWordsPerRow
-  val decoder: DecoderConfig =
-    DecoderConfig(weightBuffer, activationBuffer, accumulator, programLength, maxRunLength, requantParamSets)
+
+  // Requantizer -> WeightBuffer path (activations used as weights, directly
+  // or through the numOutputs x numOutputs Transposer), under the same kind
+  // of condition. Otherwise wbWrite.fromRequantizer/transposed have no effect.
+  val weightFeedback: Boolean =
+    requantizedWidth == cu.weightWidth && cu.numOutputs <= weightBuffer.totalWordsPerRow
+  val softmax: SoftmaxConfig = SoftmaxConfig(cu.numOutputs, requantizedWidth, softmaxStats)
+
+  // Residual-add path: an ActivationBuffer beat goes through a scaler (a
+  // Requantizer, int8 in and out: round(a * scale) saturated to int8) into
+  // Accumulator without the array, so a + b is two passes plus a drain. It
+  // exists only when an ActivationBuffer beat is one Accumulator row
+  // (numInputs == numOutputs); otherwise residual.en has no effect.
+  val residual: Boolean = cu.numInputs == cu.numOutputs
+  val residualScaler: RequantizerConfig =
+    RequantizerConfig(cu.numInputs, cu.inputWidth, cu.inputWidth, requantMultWidth, residualParamSets)
+  val decoder: DecoderConfig = DecoderConfig(
+    weightBuffer, activationBuffer, accumulator, programLength, maxRunLength, requantParamSets, softmaxStats,
+    residualParamSets)
 }
 
 class XccelIO(cfg: XccelConfig) extends Bundle {
@@ -61,6 +80,15 @@ class XccelIO(cfg: XccelConfig) extends Bundle {
   val accReadParamSet = Input(UInt(cfg.requantizer.setWidth.W))
   val accumOut = Valid(Vec(cfg.cu.numOutputs, UInt(cfg.requantizedWidth.W)))
 
+  // residual scaler parameter load, host-driven before start
+  val residualParamWriteEn = Input(Bool())
+  val residualParamWriteSet = Input(UInt(cfg.residualScaler.setWidth.W))
+  val residualParamWriteData = Input(new RequantParams(cfg.residualScaler))
+
+  // Softmax constants, host-driven before start
+  val softmaxParamWriteEn = Input(Bool())
+  val softmaxParamWriteData = Input(new SoftmaxParams(cfg.softmax))
+
   // Requantizer parameter load, host-driven before start
   val requantParamWriteEn = Input(Bool())
   val requantParamWriteSet = Input(UInt(cfg.requantizer.setWidth.W))
@@ -82,6 +110,18 @@ class Xccel(cfg: XccelConfig) extends Module {
   private val compute = Module(new SystolicArray(cfg.cu))
   private val accumulator = Module(new Accumulator(cfg.accumulator))
   private val requantizer = Module(new Requantizer(cfg.requantizer))
+  // Softmax sits on the Requantizer output and passes it through unless the
+  // program's softmax slot says otherwise; every consumer of requantized
+  // values (host drain, AB / WB / Transposer paths) reads `post`.
+  private val softmax = Module(new Softmax(cfg.softmax))
+  softmax.io.in <> requantizer.io.out
+  softmax.io.ctrl.op := decoder.io.softmax.op
+  softmax.io.ctrl.first := decoder.io.softmax.first
+  softmax.io.ctrl.lanes := decoder.io.softmax.lanes
+  softmax.io.ctrl.stat := decoder.io.softmax.stat
+  softmax.io.paramWriteEn := io.softmaxParamWriteEn
+  softmax.io.paramWriteData := io.softmaxParamWriteData
+  private val post = softmax.io.out
 
   // -- WeightBuffer: reads from the program; writes from the program while
   // running (data from the host) or from the host before start. With a
@@ -92,7 +132,21 @@ class Xccel(cfg: XccelConfig) extends Module {
   weightBuffer.io.readEn := wb.en
   weightBuffer.io.writeAddr := Mux(decoder.io.running, decoder.io.wbWrite.addr, io.wbWriteAddr)
   weightBuffer.io.writeEn := Mux(decoder.io.running, decoder.io.wbWrite.en, io.wbWriteEn)
-  weightBuffer.io.wdata := io.wbWriteData
+  // write data: the host's, the Requantizer output, or a Transposer column
+  if (cfg.weightFeedback) {
+    val transposer = Module(new Transposer(cfg.cu.numOutputs, cfg.cu.weightWidth))
+    transposer.io.capture := decoder.io.transposer.capture
+    transposer.io.row := decoder.io.transposer.row
+    transposer.io.in := post.bits
+    transposer.io.column := decoder.io.wbWrite.column
+    def pad(v: Vec[UInt]): Vec[UInt] = VecInit(Seq.tabulate(cfg.weightBuffer.totalWordsPerRow)(i =>
+      if (i < cfg.cu.numOutputs) v(i) else 0.U(cfg.cu.weightWidth.W)))
+    val ww = decoder.io.wbWrite
+    weightBuffer.io.wdata := Mux(decoder.io.running && ww.transposed, pad(transposer.io.out),
+      Mux(decoder.io.running && ww.fromRequantizer, pad(post.bits), io.wbWriteData))
+  } else {
+    weightBuffer.io.wdata := io.wbWriteData
+  }
   weightBuffer.io.shiftAmt := wb.shiftAmt
   weightBuffer.io.groupShift := wb.groupShift
 
@@ -115,7 +169,7 @@ class Xccel(cfg: XccelConfig) extends Module {
   // when the program's abWrite slot asks for it
   if (cfg.feedback) {
     val fromRequantizer = VecInit(Seq.tabulate(cfg.activationBuffer.totalWordsPerRow)(i =>
-      if (i < cfg.cu.numOutputs) requantizer.io.out.bits(i) else 0.U(cfg.cu.inputWidth.W)))
+      if (i < cfg.cu.numOutputs) post.bits(i) else 0.U(cfg.cu.inputWidth.W)))
     activationBuffer.io.wdata :=
       Mux(decoder.io.running && decoder.io.abWrite.fromRequantizer, fromRequantizer, io.abWriteData)
   } else {
@@ -125,13 +179,27 @@ class Xccel(cfg: XccelConfig) extends Module {
   activationBuffer.io.groupShift := ab.groupShift
   // activationBuffer.io.shiftIn := ab.shiftIn // line buffer disabled (accumulating kn2row)
 
-  compute.io.operandIn <> activationBuffer.io.operandOut
+  // a beat the program routes to the residual scaler never enters the array
+  compute.io.operandIn.bits := activationBuffer.io.operandOut.bits
+  compute.io.operandIn.valid := activationBuffer.io.operandOut.valid && !(cfg.residual.B && decoder.io.residual.en)
 
   // -- resultOut -> Accumulator: the write strobe is resultIn.valid
   // (self-timed), the address and add-vs-overwrite come from the program.
   // An accumulating beat uses Accumulator's read channel, so the program
   // must not schedule an accRead in the same cycle.
-  accumulator.io.resultIn <> compute.io.resultOut
+  if (cfg.residual) {
+    val scaler = Module(new Requantizer(cfg.residualScaler))
+    scaler.io.in := activationBuffer.io.operandOut
+    scaler.io.paramSet := decoder.io.residual.paramSet
+    scaler.io.paramWriteEn := io.residualParamWriteEn
+    scaler.io.paramWriteSet := io.residualParamWriteSet
+    scaler.io.paramWriteData := io.residualParamWriteData
+    val scaled = VecInit(scaler.io.out.bits.map(_.asSInt.pad(cfg.cu.outputWidth)))
+    accumulator.io.resultIn.valid := Mux(decoder.io.residual.en, scaler.io.out.valid, compute.io.resultOut.valid)
+    accumulator.io.resultIn.bits := Mux(decoder.io.residual.en, scaled, compute.io.resultOut.bits)
+  } else {
+    accumulator.io.resultIn <> compute.io.resultOut
+  }
   accumulator.io.writeAddr := decoder.io.accWrite.addr
   accumulator.io.accumulate := decoder.io.accWrite.accumulate
 
@@ -147,5 +215,5 @@ class Xccel(cfg: XccelConfig) extends Module {
   requantizer.io.paramWriteEn := io.requantParamWriteEn
   requantizer.io.paramWriteSet := io.requantParamWriteSet
   requantizer.io.paramWriteData := io.requantParamWriteData
-  io.accumOut <> requantizer.io.out
+  io.accumOut <> post
 }

@@ -32,6 +32,8 @@ class XccelTest extends AnyFlatSpec with ChiselScalatestTester {
       c.io.start.poke(false.B)
       c.io.progWriteEn.poke(false.B)
       c.io.requantParamWriteEn.poke(false.B)
+      c.io.softmaxParamWriteEn.poke(false.B)
+      c.io.residualParamWriteEn.poke(false.B)
       c.io.accReadParamSet.poke(0.U)
       c.io.wbWriteEn.poke(false.B)
       c.io.abWriteEn.poke(false.B)
@@ -144,12 +146,19 @@ class XccelTest extends AnyFlatSpec with ChiselScalatestTester {
   case object Im2col extends ConvMode // host-materialized im2col matrix, K*K*C_in cut into R-wide chunks
 
   def convPlan(mode: ConvMode, h: Int, w: Int, cin: Int, cout: Int, k: Int, rows: Int, cols: Int, seed: Int): ConvPlan = {
-    require(cout <= cols, "one C_out tile only")
-    val oh = h - k + 1
-    val ow = w - k + 1
     val rnd = new scala.util.Random(seed)
     val input = Seq.fill(h, w, cin)(rnd.nextInt(7) - 3)
     val weights = Seq.fill(k, k, cin, cout)(rnd.nextInt(7) - 3) // [kh][kw][ci][co]
+    convPlanFrom(mode, input, weights, rows, cols)
+  }
+
+  // input(y)(x)(ci), weights(kh)(kw)(ci)(co)
+  def convPlanFrom(mode: ConvMode, input: Seq[Seq[Seq[Int]]], weights: Seq[Seq[Seq[Seq[Int]]]], rows: Int, cols: Int): ConvPlan = {
+    val (h, w, cin) = (input.length, input.head.length, input.head.head.length)
+    val (k, cout) = (weights.length, weights.head.head.head.length)
+    require(cout <= cols, "one C_out tile only")
+    val oh = h - k + 1
+    val ow = w - k + 1
     def ref(y: Int, x: Int)(co: Int): Int =
       (for (kh <- 0 until k; kw <- 0 until k; ci <- 0 until cin)
         yield input(y + kh)(x + kw)(ci) * weights(kh)(kw)(ci)(co)).sum
@@ -242,14 +251,20 @@ class XccelTest extends AnyFlatSpec with ChiselScalatestTester {
     portType: BankPortType = BankPortType.OneRW,
   ): Unit = it should s"compute a 3x3 conv by $desc in $predicted cycles (conv-cycles.py prediction)" in {
     val (h, w, k, cout, cols) = (4, 4, 3, 2, 2)
-    val plan = convPlan(mode, h, w, cin, cout, k, rows, cols, seed = 7)
+    runConvPlan(convPlan(mode, h, w, cin, cout, k, rows, cols, seed = 7), rows, cols, predicted, portType)
+  }
+
+  // Loads the plan's buffers, runs its schedule on Xccel, checks the cycle
+  // count against `predicted` and every valid output against the plan.
+  def runConvPlan(plan: ConvPlan, rows: Int, cols: Int, predicted: Int, portType: BankPortType = BankPortType.OneRW): Unit = {
     val cu = ComputeUnitConfig(numInputs = rows, numOutputs = cols, inputWidth = 8, weightWidth = 8, outputWidth = 20)
     val wbCfg = WeightBufferConfig(cu, numBanks = cols, wordsPerBank = 1, tiles = plan.wbRows.length / rows,
       readLatency = 2, writeLatency = 2, portType = portType)
     val abCfg = ActivationBufferConfig(cu, numBanks = rows, wordsPerBank = 1, depth = plan.abRows.length,
       readLatency = 1, writeLatency = 1, portType = portType)
+    // at least 2 rows: a 1-row SRAM would have a zero-width address port
     val accCfg = AccumulatorConfig(cu, numBanks = cols, wordsPerBank = 1,
-      depth = plan.passes.flatMap(_.accAddrs).max + 1, readLatency = 2, writeLatency = 2)
+      depth = math.max(2, plan.passes.flatMap(_.accAddrs).max + 1), readLatency = 2, writeLatency = 2)
     val (cycles, total) = convSchedule(plan, rows, cols, wbCfg.readLatency, abCfg.readLatency, accCfg.commitLatency)
     assert(total == predicted, s"schedule gives $total cycles, conv-cycles.py predicts $predicted")
     val maxRunLength = 16
@@ -261,6 +276,8 @@ class XccelTest extends AnyFlatSpec with ChiselScalatestTester {
       c.io.start.poke(false.B)
       c.io.progWriteEn.poke(false.B)
       c.io.requantParamWriteEn.poke(false.B)
+      c.io.softmaxParamWriteEn.poke(false.B)
+      c.io.residualParamWriteEn.poke(false.B)
       c.io.accReadParamSet.poke(0.U)
       c.io.accReadEn.poke(false.B)
       c.io.abWriteEn.poke(false.B)
@@ -373,6 +390,8 @@ class XccelTest extends AnyFlatSpec with ChiselScalatestTester {
       c.io.start.poke(false.B)
       c.io.progWriteEn.poke(false.B)
       c.io.requantParamWriteEn.poke(false.B)
+      c.io.softmaxParamWriteEn.poke(false.B)
+      c.io.residualParamWriteEn.poke(false.B)
       c.io.accReadParamSet.poke(0.U)
       c.io.wbWriteEn.poke(false.B)
       c.io.abWriteEn.poke(false.B)
@@ -476,6 +495,8 @@ class XccelTest extends AnyFlatSpec with ChiselScalatestTester {
       c.io.start.poke(false.B)
       c.io.progWriteEn.poke(false.B)
       c.io.requantParamWriteEn.poke(false.B)
+      c.io.softmaxParamWriteEn.poke(false.B)
+      c.io.residualParamWriteEn.poke(false.B)
       c.io.accReadParamSet.poke(0.U)
       c.io.accReadEn.poke(false.B)
       c.io.abWriteEn.poke(false.B)
@@ -506,6 +527,8 @@ class XccelTest extends AnyFlatSpec with ChiselScalatestTester {
         c.clock.step()
       }
       c.io.requantParamWriteEn.poke(false.B)
+      c.io.softmaxParamWriteEn.poke(false.B)
+      c.io.residualParamWriteEn.poke(false.B)
       // garbage on the host data port during the run: layer 2 must only
       // ever see the Requantizer's values
       for (i <- 0 until R) c.io.abWriteData(i).poke(toU(99, cu.inputWidth))
@@ -530,5 +553,343 @@ class XccelTest extends AnyFlatSpec with ChiselScalatestTester {
       }
       c.io.accReadEn.poke(false.B)
     }
+  }
+
+  // ---- activations as weights ------------------------------------------
+  for (transposed <- Seq(false, true))
+  it should (if (transposed) "use a previous layer's output as weights through the Transposer: Y = Theta . M^T (like theta . phi^T)"
+             else "use a previous layer's output as weights directly: Y = P . M (like attention . g)") in {
+    // Layer 0 computes M = X . W0 (C x C) into Accumulator. The program
+    // drains it through the Requantizer (identity here) into WeightBuffer
+    // rows R.., either row for row (M as weights, reduction over M's rows)
+    // or via the Transposer (M^T as weights, reduction over M's columns),
+    // then layer 1 streams P (or Theta) against those weights. M never
+    // leaves the chip.
+    val R = 4; val C = 4; val N1 = 3
+    val cu = ComputeUnitConfig(numInputs = R, numOutputs = C, inputWidth = 8, weightWidth = 8, outputWidth = 20)
+    val wbCfg = WeightBufferConfig(cu, numBanks = C, wordsPerBank = 1, tiles = 2, readLatency = 2, writeLatency = 2)
+    val abCfg = ActivationBufferConfig(cu, numBanks = R, wordsPerBank = 1, depth = C + N1, readLatency = 1, writeLatency = 1)
+    val accCfg = AccumulatorConfig(cu, numBanks = C, wordsPerBank = 1, depth = C + N1, readLatency = 2, writeLatency = 2)
+    val latency = R + C - 1
+
+    val rnd = new scala.util.Random(if (transposed) 11 else 12)
+    val x = Seq.fill(C, R)(rnd.nextInt(5) - 2)
+    val w0 = Seq.fill(R, C)(rnd.nextInt(5) - 2)
+    val a = Seq.fill(N1, R)(rnd.nextInt(3) - 1) // P or Theta
+    def matmul(l: Seq[Seq[Int]], r: Seq[Seq[Int]]) = l.map(row => r.head.indices.map(j => row.indices.map(i => row(i) * r(i)(j)).sum))
+    val m = matmul(x, w0) // |m| <= 16: the identity Requantizer passes it unchanged into 8 bits
+    val y = matmul(a, if (transposed) m.transpose else m) // |y| <= 64: fits the 8-bit host drain
+    assert(m != m.transpose)
+
+    val s0 = wbCfg.readLatency + 1 - abCfg.readLatency
+    val drain = s0 + C - 1 + abCfg.readLatency + latency + accCfg.commitLatency // first accRead of M
+    val emit = drain + C - 1 + accCfg.readLatency + 1 // first Transposer column read (after the last capture)
+    val lastWbWrite = if (transposed) emit + C - 1 else drain + C - 1 + accCfg.readLatency
+    val loadW1 = lastWbWrite + wbCfg.writeLatency + 1 // first read of the new weights
+    val s1 = loadW1 + wbCfg.readLatency - abCfg.readLatency + 1
+    val total = s1 + N1 - 1 + abCfg.readLatency + latency + 1
+
+    val cycles = Array.fill(total)(CycleControl())
+    def upd(t: Int)(f: CycleControl => CycleControl): Unit = cycles(t) = f(cycles(t))
+    for (r <- 0 until R) {
+      upd(r)(_.copy(wbEn = true, wbAddr = r))
+      upd(r + wbCfg.readLatency)(_.copy(wpEn = true, wpAddr = r))
+      upd(loadW1 + r)(_.copy(wbEn = true, wbAddr = R + r))
+      upd(loadW1 + r + wbCfg.readLatency)(_.copy(wpEn = true, wpAddr = r, wpSlot = true))
+    }
+    for (j <- 0 until C) {
+      upd(s0 + j)(_.copy(abEn = true, abAddr = j))
+      upd(s0 + j + abCfg.readLatency + latency)(_.copy(accAddr = j))
+      upd(drain + j)(_.copy(accrEn = true, accrAddr = j))
+      if (transposed) {
+        upd(drain + j + accCfg.readLatency)(_.copy(tCapture = true, tRow = j))
+        upd(emit + j)(_.copy(wbwEn = true, wbwAddr = R + j, wbwTransposed = true, wbwColumn = j))
+      } else {
+        upd(drain + j + accCfg.readLatency)(_.copy(wbwEn = true, wbwAddr = R + j, wbwFromRequantizer = true))
+      }
+    }
+    for (i <- 0 until N1) {
+      upd(s1 + i)(_.copy(abEn = true, abAddr = C + i))
+      upd(s1 + i + abCfg.readLatency)(_.copy(weightSelect = true))
+      upd(s1 + i + abCfg.readLatency + latency)(_.copy(accAddr = C + i))
+    }
+    val words = CycleProgram.compress(cycles.toSeq, maxRunLength = 16)
+    val cfg = XccelConfig(cu, wbCfg, abCfg, accCfg, requantizedWidth = 8, programLength = words.length, maxRunLength = 16)
+    assert(cfg.weightFeedback)
+
+    test(new Xccel(cfg)) { c =>
+      c.io.start.poke(false.B)
+      c.io.progWriteEn.poke(false.B)
+      c.io.requantParamWriteEn.poke(false.B)
+      c.io.softmaxParamWriteEn.poke(false.B)
+      c.io.residualParamWriteEn.poke(false.B)
+      c.io.accReadParamSet.poke(0.U)
+      c.io.accReadEn.poke(false.B)
+      c.io.abWriteEn.poke(false.B)
+      c.io.wbWriteEn.poke(true.B)
+      for ((row, addr) <- w0.zipWithIndex) {
+        c.io.wbWriteAddr.poke(addr.U)
+        for ((v, i) <- row.zipWithIndex) c.io.wbWriteData(i).poke(toU(v, cu.weightWidth))
+        c.clock.step()
+      }
+      c.io.wbWriteEn.poke(false.B)
+      c.io.abWriteEn.poke(true.B)
+      for ((row, addr) <- (x ++ a).zipWithIndex) {
+        c.io.abWriteAddr.poke(addr.U)
+        for ((v, i) <- row.zipWithIndex) c.io.abWriteData(i).poke(toU(v, cu.inputWidth))
+        c.clock.step()
+      }
+      c.io.abWriteEn.poke(false.B)
+      // garbage on the host weight data port during the run: the new weights
+      // must come from the Requantizer / Transposer only
+      for (i <- 0 until C) c.io.wbWriteData(i).poke(toU(77, cu.weightWidth))
+      c.clock.step(2)
+      CycleProgram.load(new MicroProgramLoader(c.clock, c.io.progWriteEn, c.io.progWriteAddr, c.io.progWriteData), words)
+
+      c.io.start.poke(true.B)
+      c.clock.step()
+      c.io.start.poke(false.B)
+      var n = 0
+      while (c.io.running.peek().litToBoolean) { c.clock.step(); n += 1; assert(n <= total) }
+      assert(n == total)
+      c.clock.step(accCfg.commitLatency)
+
+      for ((exp, i) <- y.zipWithIndex) {
+        c.io.accReadAddr.poke((C + i).U)
+        c.io.accReadEn.poke(true.B)
+        c.clock.step(accCfg.readLatency)
+        c.io.accumOut.valid.expect(true.B)
+        for ((v, k) <- exp.zipWithIndex) c.io.accumOut.bits(k).expect(toU(v, 8))
+      }
+      c.io.accReadEn.poke(false.B)
+    }
+  }
+
+  // ---- softmax -----------------------------------------------------------
+  it should "compute an integer softmax on chip in three passes over Accumulator drains and feed it to the next matmul" in {
+    // Two logit rows of 6 (beats of 4 + 2 valid lanes, like BraggNN's 81 =
+    // 5 * 16 + 1) sit in Accumulator (an identity matmul puts them there).
+    // The program drains them three times through the Requantizer (identity)
+    // into the Softmax unit -- Max, Sum, then Out after Divide -- with the
+    // two rows in two stat slots, and writes the probabilities back to
+    // ActivationBuffer. An identity matmul then reads them like
+    // attention . g would, and the host drains the result.
+    val R = 4; val C = 4; val rowLen = 6; val rows = 2
+    val beatsPerRow = (rowLen + C - 1) / C
+    val B = rows * beatsPerRow // Accumulator beat b = row * beatsPerRow + t
+    val cu = ComputeUnitConfig(numInputs = R, numOutputs = C, inputWidth = 8, weightWidth = 8, outputWidth = 20)
+    val wbCfg = WeightBufferConfig(cu, numBanks = C, wordsPerBank = 1, tiles = 1, readLatency = 2, writeLatency = 2)
+    val abCfg = ActivationBufferConfig(cu, numBanks = R, wordsPerBank = 1, depth = 2 * B, readLatency = 1, writeLatency = 1)
+    val accCfg = AccumulatorConfig(cu, numBanks = C, wordsPerBank = 1, depth = 2 * B, readLatency = 2, writeLatency = 2)
+    val smCfg = SoftmaxConfig(C, 8, numStats = rows)
+    val latency = R + C - 1
+    val consts = SoftmaxRef.braggnn
+
+    val rnd = new scala.util.Random(21)
+    val logits = Seq.fill(rows, rowLen)(rnd.nextInt(256) - 128)
+    val probs = logits.map(SoftmaxRef.row(consts, _))
+    def beatOf(v: Seq[Seq[Int]], b: Int): Seq[Int] =
+      v(b / beatsPerRow).slice((b % beatsPerRow) * C, (b % beatsPerRow + 1) * C)
+    def lanes(b: Int) = beatOf(logits, b).length
+    val identity = Seq.tabulate(R, C)((i, j) => if (i == j) 1 else 0)
+
+    val s0 = wbCfg.readLatency + 1 - abCfg.readLatency
+    val maxPass = s0 + B - 1 + abCfg.readLatency + latency + accCfg.commitLatency // first accRead
+    val sumPass = maxPass + B
+    val divide = sumPass + B - 1 + accCfg.readLatency + 1 // Divide ops, one row per cycle
+    val outPass = divide + rows - 1 + smCfg.divLatency - accCfg.readLatency
+    val s2 = outPass + B - 1 + accCfg.readLatency + abCfg.writeLatency + 1 // after the last write (OneRW)
+    val total = s2 + B - 1 + abCfg.readLatency + latency + 1
+
+    val cycles = Array.fill(total)(CycleControl())
+    def upd(t: Int)(f: CycleControl => CycleControl): Unit = cycles(t) = f(cycles(t))
+    for (r <- 0 until R) {
+      upd(r)(_.copy(wbEn = true, wbAddr = r))
+      upd(r + wbCfg.readLatency)(_.copy(wpEn = true, wpAddr = r))
+    }
+    for (b <- 0 until B) {
+      val (row, t) = (b / beatsPerRow, b % beatsPerRow)
+      upd(s0 + b)(_.copy(abEn = true, abAddr = b))
+      upd(s0 + b + abCfg.readLatency + latency)(_.copy(accAddr = b))
+      for ((pass, op) <- Seq(maxPass -> SoftmaxOp.Max, sumPass -> SoftmaxOp.Sum, outPass -> SoftmaxOp.Out)) {
+        upd(pass + b)(_.copy(accrEn = true, accrAddr = b))
+        upd(pass + b + accCfg.readLatency)(_.copy(smOp = op, smFirst = t == 0, smLanes = lanes(b), smStat = row))
+      }
+      upd(outPass + b + accCfg.readLatency)(_.copy(abwEn = true, abwAddr = B + b, abwFromRequantizer = true))
+      upd(s2 + b)(_.copy(abEn = true, abAddr = B + b))
+      upd(s2 + b + abCfg.readLatency + latency)(_.copy(accAddr = B + b))
+    }
+    for (row <- 0 until rows) upd(divide + row)(_.copy(smOp = SoftmaxOp.Divide, smStat = row))
+    val words = CycleProgram.compress(cycles.toSeq, maxRunLength = 64)
+    val cfg = XccelConfig(cu, wbCfg, abCfg, accCfg, requantizedWidth = 8, programLength = words.length,
+      maxRunLength = 64, softmaxStats = rows)
+    assert(cfg.feedback)
+
+    test(new Xccel(cfg)) { c =>
+      c.io.start.poke(false.B)
+      c.io.progWriteEn.poke(false.B)
+      c.io.requantParamWriteEn.poke(false.B)
+      c.io.accReadParamSet.poke(0.U)
+      c.io.accReadEn.poke(false.B)
+      c.io.softmaxParamWriteEn.poke(true.B)
+      SoftmaxRef.poke(c.io.softmaxParamWriteData, consts)
+      c.clock.step()
+      c.io.softmaxParamWriteEn.poke(false.B)
+      c.io.residualParamWriteEn.poke(false.B)
+      c.io.abWriteEn.poke(false.B)
+      c.io.wbWriteEn.poke(true.B)
+      for ((row, a) <- identity.zipWithIndex) {
+        c.io.wbWriteAddr.poke(a.U)
+        for ((v, i) <- row.zipWithIndex) c.io.wbWriteData(i).poke(toU(v, cu.weightWidth))
+        c.clock.step()
+      }
+      c.io.wbWriteEn.poke(false.B)
+      c.io.abWriteEn.poke(true.B)
+      for (b <- 0 until B) {
+        c.io.abWriteAddr.poke(b.U)
+        val beat = beatOf(logits, b)
+        for (i <- 0 until R) c.io.abWriteData(i).poke(toU(beat.lift(i).getOrElse(0), cu.inputWidth))
+        c.clock.step()
+      }
+      c.io.abWriteEn.poke(false.B)
+      c.clock.step(2)
+      CycleProgram.load(new MicroProgramLoader(c.clock, c.io.progWriteEn, c.io.progWriteAddr, c.io.progWriteData), words)
+
+      c.io.start.poke(true.B)
+      c.clock.step()
+      c.io.start.poke(false.B)
+      var n = 0
+      while (c.io.running.peek().litToBoolean) { c.clock.step(); n += 1; assert(n <= total) }
+      assert(n == total)
+      c.clock.step(accCfg.commitLatency)
+
+      for (b <- 0 until B) {
+        c.io.accReadAddr.poke((B + b).U)
+        c.io.accReadEn.poke(true.B)
+        c.clock.step(accCfg.readLatency)
+        c.io.accumOut.valid.expect(true.B)
+        val exp = beatOf(probs, b)
+        for (i <- 0 until C) c.io.accumOut.bits(i).expect(toU(exp.lift(i).getOrElse(0), 8))
+      }
+      c.io.accReadEn.poke(false.B)
+    }
+  }
+
+  // ---- residual add ------------------------------------------------------
+  it should "add two activation tensors through the residual scaler and Accumulator, like BraggNN's resadd" in {
+    // out = ReLU(clamp8(roundShift((a_q + b_q) * multC, shiftC))), with
+    // a_q = clamp8(roundShift(a * multA, shiftA)) and b_q likewise, per
+    // channel tile: pass a (scaler set 0, overwrite), pass b (scaler set 1,
+    // accumulate), then a drain through the Requantizer (C_scale, ReLU).
+    // Neither pass touches the array (no weights are loaded at all).
+    val R = 4; val C = 4; val tiles = 2; val P = 5 // 8 channels, 5 pixels
+    val cu = ComputeUnitConfig(numInputs = R, numOutputs = C, inputWidth = 8, weightWidth = 8, outputWidth = 20)
+    val wbCfg = WeightBufferConfig(cu, numBanks = C, wordsPerBank = 1, tiles = 1, readLatency = 2, writeLatency = 2)
+    val abCfg = ActivationBufferConfig(cu, numBanks = R, wordsPerBank = 1, depth = 2 * tiles * P, readLatency = 1, writeLatency = 1)
+    val accCfg = AccumulatorConfig(cu, numBanks = C, wordsPerBank = 1, depth = tiles * P, readLatency = 2, writeLatency = 2)
+
+    case class Scale(mult: Int, shift: Int, lo: Int, hi: Int)
+    val scaleA = Scale(3, 2, -128, 127) // A_scale = 0.75
+    val scaleB = Scale(5, 2, -128, 127) // B_scale = 1.25, saturates for |b| > 101
+    val scaleC = Scale(1, 1, 0, 127) // C_scale = 0.5, ReLU
+    def apply(v: Int, s: Scale): Int = {
+      val p = BigInt(v) * s.mult
+      val half = BigInt(1) << (s.shift - 1)
+      ((if (p < 0) p + half - 1 else p + half) >> s.shift).max(s.lo).min(s.hi).toInt
+    }
+    val rnd = new scala.util.Random(31)
+    val a = Seq.fill(tiles, P, C)(rnd.nextInt(256) - 128) // [tile][pixel][lane]
+    val b = Seq.fill(tiles, P, C)(rnd.nextInt(256) - 128)
+    val expected = Seq.tabulate(tiles, P, C)((t, p, l) => apply(apply(a(t)(p)(l), scaleA) + apply(b(t)(p)(l), scaleB), scaleC))
+    assert(b.flatten.flatten.exists(v => math.abs(v) > 101), "b should exercise the int8 saturation")
+
+    // ActivationBuffer: a at t*P + p, b at tiles*P + t*P + p; Accumulator: t*P + p
+    val passes = for (t <- 0 until tiles; (base, set) <- Seq(0 -> 0, tiles * P -> 1)) yield (t, base, set)
+    val period = math.max(P, accCfg.commitLatency) // the b pass revisits each row one period later
+    val total = passes.length * period + abCfg.readLatency + 1
+    val cycles = Array.fill(total)(CycleControl())
+    def upd(t: Int)(f: CycleControl => CycleControl): Unit = cycles(t) = f(cycles(t))
+    for (((t, base, set), k) <- passes.zipWithIndex; p <- 0 until P) {
+      val issue = k * period + p
+      upd(issue)(_.copy(abEn = true, abAddr = base + t * P + p))
+      val arrive = issue + abCfg.readLatency
+      upd(arrive)(_.copy(rsEn = true, rsSet = set, accAddr = t * P + p, accumulate = set == 1))
+    }
+    val words = CycleProgram.compress(cycles.toSeq, maxRunLength = 16)
+    val cfg = XccelConfig(cu, wbCfg, abCfg, accCfg, requantizedWidth = 8, programLength = words.length, maxRunLength = 16)
+    assert(cfg.residual)
+
+    test(new Xccel(cfg)) { c =>
+      c.io.start.poke(false.B)
+      c.io.progWriteEn.poke(false.B)
+      c.io.softmaxParamWriteEn.poke(false.B)
+      c.io.accReadParamSet.poke(0.U)
+      c.io.accReadEn.poke(false.B)
+      c.io.wbWriteEn.poke(false.B)
+      def loadScale(en: Bool, setPort: UInt, data: RequantParams, set: Int, s: Scale): Unit = {
+        en.poke(true.B)
+        setPort.poke(set.U)
+        for (i <- 0 until C) {
+          data.bias(i).poke(0.S)
+          data.mult(i).poke(s.mult.U)
+          data.shift(i).poke(s.shift.U)
+        }
+        data.lo.poke(s.lo.S)
+        data.hi.poke(s.hi.S)
+        c.clock.step()
+        en.poke(false.B)
+      }
+      loadScale(c.io.residualParamWriteEn, c.io.residualParamWriteSet, c.io.residualParamWriteData, 0, scaleA)
+      loadScale(c.io.residualParamWriteEn, c.io.residualParamWriteSet, c.io.residualParamWriteData, 1, scaleB)
+      loadScale(c.io.requantParamWriteEn, c.io.requantParamWriteSet, c.io.requantParamWriteData, 0, scaleC)
+      c.io.abWriteEn.poke(true.B)
+      for ((row, addr) <- (a.flatten ++ b.flatten).zipWithIndex) {
+        c.io.abWriteAddr.poke(addr.U)
+        for ((v, i) <- row.zipWithIndex) c.io.abWriteData(i).poke(toU(v, cu.inputWidth))
+        c.clock.step()
+      }
+      c.io.abWriteEn.poke(false.B)
+      c.clock.step(2)
+      CycleProgram.load(new MicroProgramLoader(c.clock, c.io.progWriteEn, c.io.progWriteAddr, c.io.progWriteData), words)
+
+      c.io.start.poke(true.B)
+      c.clock.step()
+      c.io.start.poke(false.B)
+      var n = 0
+      while (c.io.running.peek().litToBoolean) { c.clock.step(); n += 1; assert(n <= total) }
+      assert(n == total)
+      c.clock.step(accCfg.commitLatency)
+
+      for (t <- 0 until tiles; p <- 0 until P) {
+        c.io.accReadAddr.poke((t * P + p).U)
+        c.io.accReadEn.poke(true.B)
+        c.clock.step(accCfg.readLatency)
+        c.io.accumOut.valid.expect(true.B)
+        for (l <- 0 until C) c.io.accumOut.bits(l).expect(toU(expected(t)(p)(l), 8))
+      }
+      c.io.accReadEn.poke(false.B)
+    }
+  }
+
+  // ---- flattened fully connected layer -------------------------------------
+  it should "compute a flattened fully connected layer as a conv whose kernel is the whole input (like BraggNN fc1)" in {
+    // y = flatten_CHW(x) . W_fc with x 3x3x4 (36 values) and 4 outputs, on a
+    // 4x4 array. Flattening costs nothing: y is the 3x3 conv of x whose output
+    // is 1x1, and the 1x1 weight tile at kernel position (kh, kw) is the
+    // host's regrouping W[kh][kw][ci][co] = W_fc[ci*9 + kh*3 + kw][co]
+    // (PyTorch's CHW flatten order). x stays one pixel per ActivationBuffer
+    // row, as the previous conv left it; each of the 9 passes streams one
+    // pixel into the same Accumulator row.
+    // Prediction: python3 conv-cycles.py --conv 3 3 4 4 3 --rows 4 --cols 4 (valid)
+    val (h, w, cin, cout) = (3, 3, 4, 4)
+    val rnd = new scala.util.Random(41)
+    val x = Seq.fill(h, w, cin)(rnd.nextInt(7) - 3)
+    val wfc = Seq.fill(h * w * cin, cout)(rnd.nextInt(7) - 3)
+    val flat = for (ci <- 0 until cin; y <- 0 until h; xx <- 0 until w) yield x(y)(xx)(ci)
+    val expected = Seq.tabulate(cout)(o => flat.indices.map(i => flat(i) * wfc(i)(o)).sum)
+    val weights = Seq.tabulate(h, w, cin, cout)((kh, kw, ci, co) => wfc(ci * h * w + kh * w + kw)(co))
+    val plan = convPlanFrom(ValidOnly, x, weights, rows = 4, cols = 4)
+    assert(plan.outputs == Seq(0 -> expected), "the regrouped conv must equal the flattened matmul")
+    runConvPlan(plan, rows = 4, cols = 4, predicted = 43)
   }
 }

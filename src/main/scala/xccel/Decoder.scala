@@ -49,6 +49,42 @@ class WriteSlot(addrWidth: Int) extends WriteAddrSlot(addrWidth) {
   val en = Bool()
 }
 
+// WeightBuffer write: the data comes from the host, or, with
+// fromRequantizer, from the Requantizer output in that same cycle (an
+// activation used as weights, e.g. g in attention . g), or, with
+// transposed, from Transposer column `column` (e.g. phi^T in
+// theta . phi^T). transposed takes precedence over fromRequantizer.
+class WeightWriteSlot(addrWidth: Int, transposerIndexWidth: Int) extends WriteSlot(addrWidth) {
+  val fromRequantizer = Bool()
+  val transposed = Bool()
+  val column = UInt(transposerIndexWidth.W)
+  val columnStride = UInt(transposerIndexWidth.W)
+}
+
+// Residual add: route the ActivationBuffer beat arriving this cycle
+// (abRead + activationBuffer.readLatency) through the residual scaler
+// (parameter set paramSet) straight into Accumulator instead of the array.
+class ResidualSlot(setWidth: Int) extends Bundle {
+  val en = Bool()
+  val paramSet = UInt(setWidth.W)
+}
+
+// Softmax: what the Softmax unit does with the Requantizer beat of this
+// cycle (SoftmaxOp: None passes it through), for which row in flight.
+class SoftmaxSlot(lanesWidth: Int, statWidth: Int) extends Bundle {
+  val op = UInt(SoftmaxOp.width.W)
+  val first = Bool()
+  val lanes = UInt(lanesWidth.W)
+  val stat = UInt(statWidth.W)
+}
+
+// Transposer: capture the Requantizer output of this cycle into row `row`.
+class TransposerSlot(indexWidth: Int) extends Bundle {
+  val capture = Bool()
+  val row = UInt(indexWidth.W)
+  val rowStride = UInt(indexWidth.W)
+}
+
 // ActivationBuffer write: the data comes from the host, or, with
 // fromRequantizer, from the Requantizer output in that same cycle (the
 // layer-to-layer path: place it accumulator.readLatency after the accRead
@@ -82,7 +118,7 @@ class MicroWord(cfg: DecoderConfig) extends Bundle {
     cfg.weightBuffer.adapter.shiftWidth,
     cfg.weightBuffer.adapter.groupShiftWidth,
   )
-  val wbWrite = new WriteSlot(cfg.weightBuffer.sram.addrWidth)
+  val wbWrite = new WeightWriteSlot(cfg.weightBuffer.sram.addrWidth, cfg.transposerIndexWidth)
   val weightPort = new WritePortSlot(cfg.weightPortAddrWidth)
   val abWrite = new ActivationWriteSlot(cfg.activationBuffer.sram.addrWidth)
   val abRead = new ActivationReadSlot(
@@ -98,6 +134,9 @@ class MicroWord(cfg: DecoderConfig) extends Bundle {
     cfg.accumulator.adapter.groupShiftWidth,
   )
   val requant = new RequantSlot(cfg.requantSetWidth)
+  val transposer = new TransposerSlot(cfg.transposerIndexWidth)
+  val softmax = new SoftmaxSlot(cfg.softmaxLanesWidth, cfg.softmaxStatWidth)
+  val residual = new ResidualSlot(cfg.residualSetWidth)
   val length = UInt(cfg.lengthWidth.W) // cycles this word is held, must be >= 1
   val halt = Bool() // stop after this word's last cycle
 }
@@ -118,6 +157,17 @@ class ActivationReadCtrl(addrWidth: Int, shiftWidth: Int, groupShiftWidth: Int)
 class WriteCtrl(addrWidth: Int) extends Bundle {
   val en = Bool()
   val addr = UInt(addrWidth.W)
+}
+
+class WeightWriteCtrl(addrWidth: Int, transposerIndexWidth: Int) extends WriteCtrl(addrWidth) {
+  val fromRequantizer = Bool()
+  val transposed = Bool()
+  val column = UInt(transposerIndexWidth.W)
+}
+
+class TransposerCtrl(indexWidth: Int) extends Bundle {
+  val capture = Bool()
+  val row = UInt(indexWidth.W)
 }
 
 class ActivationWriteCtrl(addrWidth: Int) extends WriteCtrl(addrWidth) {
@@ -142,6 +192,8 @@ case class DecoderConfig(
   programLength: Int,
   maxRunLength: Int,
   requantParamSets: Int = 1,
+  softmaxStats: Int = 1,
+  residualParamSets: Int = 2,
 ) {
   require(programLength > 0, "programLength must be positive")
   require(maxRunLength > 0, "maxRunLength must be positive")
@@ -155,6 +207,12 @@ case class DecoderConfig(
   val weightPortAddrWidth: Int = math.max(1, log2Ceil(weightBuffer.cu.numInputs))
   val lengthWidth: Int = log2Ceil(maxRunLength + 1)
   val requantSetWidth: Int = math.max(1, log2Ceil(requantParamSets))
+  // Transposer is numOutputs x numOutputs (one Requantizer beat per row)
+  val transposerIndexWidth: Int = math.max(1, log2Ceil(weightBuffer.cu.numOutputs))
+  // Softmax works on numOutputs-lane beats
+  val softmaxLanesWidth: Int = log2Ceil(weightBuffer.cu.numOutputs + 1)
+  val softmaxStatWidth: Int = math.max(1, log2Ceil(softmaxStats))
+  val residualSetWidth: Int = math.max(1, log2Ceil(residualParamSets))
   val wordIdxWidth: Int = math.max(1, log2Ceil(programLength))
 }
 
@@ -172,7 +230,7 @@ class DecoderIO(cfg: DecoderConfig) extends Bundle {
     cfg.weightBuffer.adapter.shiftWidth,
     cfg.weightBuffer.adapter.groupShiftWidth,
   ))
-  val wbWrite = Output(new WriteCtrl(cfg.weightBuffer.sram.addrWidth))
+  val wbWrite = Output(new WeightWriteCtrl(cfg.weightBuffer.sram.addrWidth, cfg.transposerIndexWidth))
   val weightPort = Output(new WritePortCtrl(cfg.weightPortAddrWidth))
   val abWrite = Output(new ActivationWriteCtrl(cfg.activationBuffer.sram.addrWidth))
   val abRead = Output(new ActivationReadCtrl(
@@ -182,6 +240,9 @@ class DecoderIO(cfg: DecoderConfig) extends Bundle {
   ))
   val weightSelect = Output(Bool())
   val requantParamSet = Output(UInt(cfg.requantSetWidth.W))
+  val transposer = Output(new TransposerCtrl(cfg.transposerIndexWidth))
+  val softmax = Output(new SoftmaxSlot(cfg.softmaxLanesWidth, cfg.softmaxStatWidth))
+  val residual = Output(new ResidualSlot(cfg.residualSetWidth))
   val accWrite = Output(new AccWriteCtrl(cfg.accumulator.sram.addrWidth))
   val accRead = Output(new ReadCtrl(
     cfg.accumulator.sram.addrWidth,
@@ -247,6 +308,15 @@ class Decoder(cfg: DecoderConfig) extends Module {
   }
 
   resolveWrite(word.wbWrite, io.wbWrite)
+  io.wbWrite.fromRequantizer := word.wbWrite.fromRequantizer
+  io.wbWrite.transposed := word.wbWrite.transposed
+  io.wbWrite.column := strided(word.wbWrite.column, word.wbWrite.columnStride)
+  io.residual.en := running && word.residual.en
+  io.residual.paramSet := word.residual.paramSet
+  io.softmax := word.softmax
+  io.softmax.op := Mux(running, word.softmax.op, SoftmaxOp.None.U)
+  io.transposer.capture := running && word.transposer.capture
+  io.transposer.row := strided(word.transposer.row, word.transposer.rowStride)
   resolveWrite(word.abWrite, io.abWrite)
   io.abWrite.fromRequantizer := word.abWrite.fromRequantizer
   resolveWrite(word.weightPort, io.weightPort)

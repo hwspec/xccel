@@ -43,6 +43,17 @@ case class CycleControl(
   wbAddr: Int = 0,
   wbwEn: Boolean = false,
   wbwAddr: Int = 0,
+  wbwFromRequantizer: Boolean = false,
+  wbwTransposed: Boolean = false,
+  wbwColumn: Int = 0,
+  tCapture: Boolean = false,
+  tRow: Int = 0,
+  smOp: Int = SoftmaxOp.None,
+  smFirst: Boolean = false,
+  smLanes: Int = 0,
+  smStat: Int = 0,
+  rsEn: Boolean = false,
+  rsSet: Int = 0,
   abwEn: Boolean = false,
   abwAddr: Int = 0,
   abwFromRequantizer: Boolean = false,
@@ -58,8 +69,8 @@ case class CycleControl(
   accAddr: Int = 0,
   accumulate: Boolean = false,
 ) {
-  def flags = (wbEn, wbwEn, abwEn, abwFromRequantizer, accrEn, requantSet, wpEn, wpSlot, abEn, weightSelect, accumulate)
-  def addrs = Seq(wbAddr, wpAddr, abAddr, accAddr, wbwAddr, abwAddr, accrAddr)
+  def flags = (rsEn, rsSet, smOp, smFirst, smLanes, smStat, wbEn, wbwEn, wbwFromRequantizer, wbwTransposed, tCapture, abwEn, abwFromRequantizer, accrEn, requantSet, wpEn, wpSlot, abEn, weightSelect, accumulate)
+  def addrs = Seq(wbAddr, wpAddr, abAddr, accAddr, wbwAddr, abwAddr, accrAddr, wbwColumn, tRow)
 }
 
 // A run of cycles folded into one word: `first` plus per-address strides.
@@ -92,7 +103,7 @@ object CycleProgram {
   def load(p: MicroProgramLoader, words: Seq[FoldedWord]): Unit = {
     for ((fw, i) <- words.zipWithIndex) {
       val c = fw.first
-      val Seq(wbS, wpS, abS, accS, wbwS, abwS, accrS) = fw.strides
+      val Seq(wbS, wpS, abS, accS, wbwS, abwS, accrS, colS, rowS) = fw.strides
       p.word(length = fw.length, halt = i == words.length - 1) { w =>
         def poke(u: UInt, v: Int): Unit = u.poke((BigInt(v) & ((BigInt(1) << u.getWidth) - 1)).U(u.getWidth.W))
         w.wbRead.en.poke(c.wbEn.B)
@@ -110,6 +121,19 @@ object CycleProgram {
         poke(w.accWrite.addrStride, accS)
         w.accWrite.accumulate.poke(c.accumulate.B)
         w.wbWrite.en.poke(c.wbwEn.B)
+        w.wbWrite.fromRequantizer.poke(c.wbwFromRequantizer.B)
+        w.wbWrite.transposed.poke(c.wbwTransposed.B)
+        poke(w.wbWrite.column, c.wbwColumn)
+        poke(w.wbWrite.columnStride, colS)
+        w.residual.en.poke(c.rsEn.B)
+        poke(w.residual.paramSet, c.rsSet)
+        poke(w.softmax.op, c.smOp)
+        w.softmax.first.poke(c.smFirst.B)
+        poke(w.softmax.lanes, c.smLanes)
+        poke(w.softmax.stat, c.smStat)
+        w.transposer.capture.poke(c.tCapture.B)
+        poke(w.transposer.row, c.tRow)
+        poke(w.transposer.rowStride, rowS)
         poke(w.wbWrite.addr, c.wbwAddr)
         poke(w.wbWrite.addrStride, wbwS)
         w.abWrite.en.poke(c.abwEn.B)
