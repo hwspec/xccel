@@ -6,144 +6,163 @@ import org.scalatest.flatspec.AnyFlatSpec
 
 class DecoderTest extends AnyFlatSpec with ChiselScalatestTester {
 
-  def loadInstr(
-    c: Decoder,
-    idx: Int,
-    source: DecoderSource.Type,
-    op: DecoderOp.Type,
-    baseAddr: Int,
-    baseShiftAmt: Int,
-    groupShift: Int,
-    length: Int,
-  ): Unit = {
-    c.io.progWriteAddr.poke(idx.U)
-    c.io.progWriteData.source.poke(source)
-    c.io.progWriteData.op.poke(op)
-    c.io.progWriteData.baseAddr.poke(baseAddr.U)
-    c.io.progWriteData.baseShiftAmt.poke(baseShiftAmt.U)
-    c.io.progWriteData.groupShift.poke(groupShift.U)
-    c.io.progWriteData.length.poke(length.U)
-    c.io.progWriteEn.poke(true.B)
+  val cuCfg = ComputeUnitConfig(numInputs = 4, numOutputs = 2, inputWidth = 8, weightWidth = 8, outputWidth = 20)
+  val wbCfg = WeightBufferConfig(cuCfg, numBanks = cuCfg.numOutputs, wordsPerBank = 1, tiles = 1,
+    readLatency = 2, writeLatency = 2)
+  val abCfg = ActivationBufferConfig(cuCfg, numBanks = cuCfg.numInputs, wordsPerBank = 1, depth = 8,
+    readLatency = 1, writeLatency = 1)
+  val accCfg = AccumulatorConfig(cuCfg, numBanks = cuCfg.numOutputs, wordsPerBank = 1, depth = 4,
+    readLatency = 2, writeLatency = 2)
+
+  def loader(c: Decoder) =
+    new MicroProgramLoader(c.clock, c.io.progWriteEn, c.io.progWriteAddr, c.io.progWriteData)
+
+  def pulseStart(c: Decoder): Unit = {
+    c.io.start.poke(true.B)
     c.clock.step()
+    c.io.start.poke(false.B)
   }
 
-  "Decoder" should "sequence WeightBufferRead(ADVANCE), ActivationBufferRead(ADVANCE then RESELECT)," +
-    " AccumulatorRead(ADVANCE), then self-terminate on Halt" in {
-      val cuCfg = ComputeUnitConfig(numInputs = 4, numOutputs = 2, inputWidth = 8, weightWidth = 8, outputWidth = 20)
-      val wbCfg = WeightBufferConfig(cuCfg, numBanks = cuCfg.numOutputs, wordsPerBank = 1, tiles = 1,
-        readLatency = 2, writeLatency = 2)
-      val abCfg = ActivationBufferConfig(cuCfg, numBanks = cuCfg.numInputs, wordsPerBank = 1, depth = 8,
-        readLatency = 1, writeLatency = 1)
-      val accCfg = AccumulatorConfig(cuCfg, numBanks = cuCfg.numOutputs, wordsPerBank = 1, depth = 4,
-        readLatency = 2, writeLatency = 2)
+  "Decoder" should "hold each word for its length, apply strides per cycle, drive slots in parallel," +
+    " and self-terminate on halt" in {
       val cfg = DecoderConfig(wbCfg, abCfg, accCfg, programLength = 5, maxRunLength = 2)
 
       test(new Decoder(cfg)) { c =>
-        // instr0: WeightBufferRead ADVANCE, addr 0..1 (2 steps)
-        loadInstr(c, 0, DecoderSource.WeightBufferRead, DecoderOp.Advance, baseAddr = 0, baseShiftAmt = 0,
-          groupShift = 0, length = 2)
-        // instr1: ActivationBufferRead ADVANCE, addr=0 (1 step)
-        loadInstr(c, 1, DecoderSource.ActivationBufferRead, DecoderOp.Advance, baseAddr = 0, baseShiftAmt = 0,
-          groupShift = 0, length = 1)
-        // instr2: ActivationBufferRead RESELECT, addr fixed=5, shiftAmt 0..1 (2 steps)
-        loadInstr(c, 2, DecoderSource.ActivationBufferRead, DecoderOp.Reselect, baseAddr = 5, baseShiftAmt = 0,
-          groupShift = 0, length = 2)
-        // instr3: AccumulatorRead ADVANCE, addr=2 (1 step)
-        loadInstr(c, 3, DecoderSource.AccumulatorRead, DecoderOp.Advance, baseAddr = 2, baseShiftAmt = 0,
-          groupShift = 1, length = 1)
-        // instr4: Halt
-        loadInstr(c, 4, DecoderSource.Halt, DecoderOp.Advance, baseAddr = 0, baseShiftAmt = 0, groupShift = 0,
-          length = 1)
-        c.io.progWriteEn.poke(false.B)
+        val p = loader(c)
+        // w0: WeightBuffer read, addr 0,1, while writing WeightBuffer addr
+        // 3,2 and ActivationBuffer addr 4,6
+        p.word(length = 2) { w =>
+          w.wbRead.en.poke(true.B)
+          w.wbRead.addrStride.poke(1.U)
+          w.wbWrite.en.poke(true.B)
+          w.wbWrite.addr.poke(3.U)
+          w.wbWrite.addrStride.poke(MicroProgramLoader.minusOne(wbCfg.sram.addrWidth))
+          w.abWrite.en.poke(true.B)
+          w.abWrite.addr.poke(4.U)
+          w.abWrite.addrStride.poke(2.U)
+        }
+        // w1: ActivationBuffer sweeping shiftAmt 0,1 at a fixed addr, in
+        // parallel with the weight port writing slot 1, addr 0,1
+        p.word(length = 2) { w =>
+          w.abRead.en.poke(true.B)
+          w.abRead.addr.poke(5.U)
+          w.abRead.shiftStride.poke(1.U)
+          w.weightPort.en.poke(true.B)
+          w.weightPort.addrStride.poke(1.U)
+          w.weightPort.slot.poke(true.B)
+        }
+        // w2: one more ActivationBuffer read, compute selecting weight slot 1
+        p.word(length = 1) { w =>
+          w.abRead.en.poke(true.B)
+          w.abRead.addr.poke(5.U)
+          w.abRead.shiftAmt.poke(2.U)
+          w.compute.weightSelect.poke(true.B)
+        }
+        // w3: Accumulator drain counting down (addr 3,2) with groupShift=1,
+        // accumulating writes counting up (1,2)
+        p.word(length = 2) { w =>
+          w.accRead.en.poke(true.B)
+          w.accRead.addr.poke(3.U)
+          w.accRead.addrStride.poke(MicroProgramLoader.minusOne(accCfg.sram.addrWidth))
+          w.accRead.groupShift.poke(1.U)
+          w.accWrite.addr.poke(1.U)
+          w.accWrite.addrStride.poke(1.U)
+          w.accWrite.accumulate.poke(true.B)
+        }
+        // w4: idle, halt
+        p.word(length = 1, halt = true)()
+        p.done()
 
-        c.io.start.poke(true.B)
-        c.clock.step()
-        c.io.start.poke(false.B)
+        pulseStart(c)
         c.io.running.expect(true.B)
 
-        // cycle0,1: instr0 (WeightBufferRead ADVANCE), addr = baseAddr+offset = 0,1
-        for (expectedAddr <- Seq(0, 1)) {
-          c.io.wbEn.expect(true.B)
-          c.io.wbAddr.expect(expectedAddr.U)
-          c.io.abEn.expect(false.B)
-          c.io.accEn.expect(false.B)
+        // t0,1: w0
+        for ((a, i) <- Seq(0, 1).zipWithIndex) {
+          c.io.wbRead.en.expect(true.B)
+          c.io.wbRead.addr.expect(a.U)
+          c.io.wbWrite.en.expect(true.B)
+          c.io.wbWrite.addr.expect((3 - i).U)
+          c.io.abWrite.en.expect(true.B)
+          c.io.abWrite.addr.expect((4 + 2 * i).U)
+          c.io.abRead.en.expect(false.B)
+          c.io.weightPort.en.expect(false.B)
+          c.io.accRead.en.expect(false.B)
+          c.io.weightSelect.expect(false.B)
+          c.io.accWrite.accumulate.expect(false.B)
           c.clock.step()
         }
 
-        // cycle2: instr1 (ActivationBufferRead ADVANCE), single step, shiftIn always true on ADVANCE
-        c.io.abEn.expect(true.B)
-        c.io.abAddr.expect(0.U)
-        c.io.abShiftAmt.expect(0.U)
-        c.io.abShiftIn.expect(true.B)
-        c.io.wbEn.expect(false.B)
+        // t2,3: w1, both slots active in the same cycles
+        for (s <- Seq(0, 1)) {
+          c.io.wbRead.en.expect(false.B)
+          c.io.abRead.en.expect(true.B)
+          c.io.abRead.addr.expect(5.U)
+          c.io.abRead.shiftAmt.expect(s.U)
+          c.io.weightPort.en.expect(true.B)
+          c.io.weightPort.addr.expect(s.U)
+          c.io.weightPort.slot.expect(true.B)
+          c.io.weightSelect.expect(false.B)
+          c.clock.step()
+        }
+
+        // t4: w2
+        c.io.abRead.en.expect(true.B)
+        c.io.abRead.addr.expect(5.U)
+        c.io.abRead.shiftAmt.expect(2.U)
+        c.io.weightSelect.expect(true.B)
+        c.io.weightPort.en.expect(false.B)
         c.clock.step()
 
-        // cycle3: instr2 step0 (RESELECT), addr fixed at baseAddr=5, shiftAmt=0, NOT the last step -> shiftIn=false
-        c.io.abEn.expect(true.B)
-        c.io.abAddr.expect(5.U)
-        c.io.abShiftAmt.expect(0.U)
-        c.io.abShiftIn.expect(false.B)
-        c.clock.step()
+        // t5,6: w3
+        for ((r, wr) <- Seq((3, 1), (2, 2))) {
+          c.io.abRead.en.expect(false.B)
+          c.io.accRead.en.expect(true.B)
+          c.io.accRead.addr.expect(r.U)
+          c.io.accRead.groupShift.expect(1.U)
+          c.io.accWrite.addr.expect(wr.U)
+          c.io.accWrite.accumulate.expect(true.B)
+          c.io.weightSelect.expect(false.B)
+          c.clock.step()
+        }
 
-        // cycle4: instr2 step1 (RESELECT), addr STILL 5 (unchanged), shiftAmt=1, last step -> shiftIn=true
-        c.io.abEn.expect(true.B)
-        c.io.abAddr.expect(5.U)
-        c.io.abShiftAmt.expect(1.U)
-        c.io.abShiftIn.expect(true.B)
-        c.clock.step()
-
-        // cycle5: instr3 (AccumulatorRead ADVANCE), addr=2, groupShift=1
-        c.io.accEn.expect(true.B)
-        c.io.accAddr.expect(2.U)
-        c.io.accGroupShift.expect(1.U)
-        c.io.abEn.expect(false.B)
-        c.clock.step()
-
-        // cycle6: instr4 (Halt) -- nothing active, running still true this cycle
-        c.io.wbEn.expect(false.B)
-        c.io.abEn.expect(false.B)
-        c.io.accEn.expect(false.B)
+        // t7: w4 (halt word) -- nothing enabled, still running this cycle
+        c.io.wbRead.en.expect(false.B)
+        c.io.wbWrite.en.expect(false.B)
+        c.io.abWrite.en.expect(false.B)
+        c.io.abRead.en.expect(false.B)
+        c.io.weightPort.en.expect(false.B)
+        c.io.accRead.en.expect(false.B)
         c.io.running.expect(true.B)
         c.clock.step()
 
-        // running deasserts once the Halt instruction has been processed
         c.io.running.expect(false.B)
       }
     }
 
-  it should "shadow wbAddr by weightPortDelay cycles onto weightWriteAddr" in {
-    val cuCfg = ComputeUnitConfig(numInputs = 2, numOutputs = 2, inputWidth = 8, weightWidth = 8, outputWidth = 20)
-    val wbCfg = WeightBufferConfig(cuCfg, numBanks = cuCfg.numOutputs, wordsPerBank = 1, tiles = 1,
-      readLatency = 2, writeLatency = 2)
-    val abCfg = ActivationBufferConfig(cuCfg, numBanks = cuCfg.numInputs, wordsPerBank = 1, depth = 4,
-      readLatency = 1, writeLatency = 1)
-    val accCfg = AccumulatorConfig(cuCfg, numBanks = cuCfg.numOutputs, wordsPerBank = 1, depth = 4,
-      readLatency = 2, writeLatency = 2)
-    val cfg = DecoderConfig(wbCfg, abCfg, accCfg, programLength = 2, maxRunLength = 2)
+  it should "execute the halt word itself, and restart from word 0 with fresh strides" in {
+    val cfg = DecoderConfig(wbCfg, abCfg, accCfg, programLength = 1, maxRunLength = 3)
 
     test(new Decoder(cfg)) { c =>
-      loadInstr(c, 0, DecoderSource.WeightBufferRead, DecoderOp.Advance, baseAddr = 0, baseShiftAmt = 0,
-        groupShift = 0, length = 2)
-      loadInstr(c, 1, DecoderSource.Halt, DecoderOp.Advance, baseAddr = 0, baseShiftAmt = 0, groupShift = 0,
-        length = 1)
-      c.io.progWriteEn.poke(false.B)
+      val p = loader(c)
+      p.word(length = 3, halt = true) { w =>
+        w.wbRead.en.poke(true.B)
+        w.wbRead.addr.poke(1.U)
+        w.wbRead.addrStride.poke(1.U)
+      }
+      p.done()
 
-      c.io.start.poke(true.B)
-      c.clock.step()
-      c.io.start.poke(false.B)
-
-      // wbAddr = 0, 1 on the two ADVANCE steps
-      for (expectedAddr <- Seq(0, 1)) {
-        c.io.wbAddr.expect(expectedAddr.U)
+      for (_ <- 0 until 2) {
+        pulseStart(c)
+        for (a <- Seq(1, 2, 3)) {
+          c.io.running.expect(true.B)
+          c.io.wbRead.en.expect(true.B)
+          c.io.wbRead.addr.expect(a.U)
+          c.clock.step()
+        }
+        c.io.running.expect(false.B)
+        c.io.wbRead.en.expect(false.B)
         c.clock.step()
       }
-
-      // weightWriteAddr echoes wbAddr, delayed by weightPortDelay (=2) cycles:
-      // wbAddr was 0 at cycle0, so weightWriteAddr shows 0 at cycle0+2=cycle2,
-      // which is exactly where the loop above already left us (2 steps done)
-      c.io.weightWriteAddr.expect(0.U)
-      c.clock.step()
-      c.io.weightWriteAddr.expect(1.U)
     }
   }
 }

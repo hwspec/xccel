@@ -4,7 +4,7 @@ XCCEL is a framework for exploring the SRAM design and compute unit in X-ray det
 This framework abstracts near-sensor AI accelerators to the input activation buffer, weight buffer, accumulator, compute unit, and instraction decoder, assuming deterministic dataflow such as Groq.
 The user (whichever the human or AI agents) can specify the number of SRAMs and design of each buffer including depth, word length, the number of ports, port bandwidth, mask granularity, and read/write latency.
 Moreover, the user can replace a compute unit with their IP such as systolic array, reduction tree, and vector engine.
-Note that it does never have caches, reservation station, and arbiters inside the accelerator since it adopts deterministic dataflow architecture.
+It does not have any caches, reservation station, and arbiters inside the accelerator since it adopts deterministic dataflow architecture.
 
 
 ## Design Principle

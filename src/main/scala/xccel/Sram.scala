@@ -76,6 +76,52 @@ class SramIO(cfg: SramConfig) extends Bundle {
 }
 
 
+object Sram {
+  // Drives one read stream and one write stream onto an Sram's channels,
+  // for any port type, and returns each bank's rdata. `wdata(n)` is bank
+  // n's packed row. OneRW: both share the bank's single channel; a read
+  // takes it, so a write in the same cycle is dropped. OneR1W: each stream
+  // gets its own channel. TwoRW: channel 0 reads, channel 1 writes (its
+  // ability to do two reads per cycle is not used here).
+  def connectReadWrite(
+    cfg: SramConfig,
+    io: SramIO,
+    readAddr: UInt,
+    readEn: Bool,
+    writeAddr: UInt,
+    writeEn: Bool,
+    wdata: Seq[UInt],
+  ): Seq[UInt] = {
+    val fullMask = ((BigInt(1) << cfg.maskBits) - 1).U(cfg.maskBits.W)
+    (0 until cfg.numBanks).map { n =>
+      cfg.portType match {
+        case BankPortType.OneRW =>
+          val ch = io.banks(n)
+          ch.addr := Mux(readEn, readAddr, writeAddr)
+          ch.en := readEn || writeEn
+          ch.wen := !readEn
+          ch.wdata := wdata(n)
+          ch.wmask := fullMask
+          ch.rdata
+        case BankPortType.OneR1W | BankPortType.TwoRW =>
+          val r = io.banks(2 * n)
+          val w = io.banks(2 * n + 1)
+          r.addr := readAddr
+          r.en := readEn
+          r.wen := false.B
+          r.wdata := 0.U
+          r.wmask := 0.U
+          w.addr := writeAddr
+          w.en := writeEn
+          w.wen := true.B
+          w.wdata := wdata(n)
+          w.wmask := fullMask
+          r.rdata
+      }
+    }
+  }
+}
+
 class Sram(cfg: SramConfig) extends Module {
   val io = IO(new SramIO(cfg))
 

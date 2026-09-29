@@ -12,8 +12,8 @@ case class ComputeUnitConfig(numInputs: Int, numOutputs: Int, inputWidth: Int, w
 }
 
 class ComputeUnitIO(cfg: ComputeUnitConfig) extends Bundle {
-  val operandIn = Flipped(Decoupled(Vec(cfg.numInputs, UInt(cfg.inputWidth.W))))
-  val resultOut = Decoupled(Vec(cfg.numOutputs, SInt(cfg.outputWidth.W)))
+  val operandIn = Flipped(Valid(Vec(cfg.numInputs, UInt(cfg.inputWidth.W))))
+  val resultOut = Valid(Vec(cfg.numOutputs, SInt(cfg.outputWidth.W)))
 }
 
 abstract class ComputeUnit(val cfg: ComputeUnitConfig) extends Module {
@@ -29,4 +29,10 @@ trait HasStationaryWeights { this: ComputeUnit =>
   val weightWriteAddr = IO(Input(UInt(weightAddrWidth.W)))
   val weightWriteEn = IO(Input(Bool()))
   val weightWriteData = IO(Input(Vec(weightBeatElems, UInt(weightBeatWidth.W))))
+  // Two weight register slots per PE: writes land in slot weightWriteSlot
+  // while the unit computes from the other. weightSelect picks the slot for
+  // the operand presented on operandIn in the same cycle and travels with
+  // it, so a slot switch never splits one operand across two weight sets.
+  val weightWriteSlot = IO(Input(Bool()))
+  val weightSelect = IO(Input(Bool()))
 }

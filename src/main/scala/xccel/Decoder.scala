@@ -3,38 +3,118 @@ package xccel
 import chisel3._
 import chisel3.util._
 
-// ADVANCE: offset advances `addr` (a genuinely new row each step, e.g.
-// loading new resident rows into a line buffer). RESELECT: offset
-// advances `shiftAmt` instead, `addr` stays fixed at baseAddr (re-select
-// within whatever is already resident, e.g. sweeping columns of an
-// already-loaded window). Both cost the same 1 cycle/step -- the
-// distinction is about correctness (does this step's row need to be
-// captured into ActivationBuffer's line-buffer history), not throughput.
-object DecoderOp extends ChiselEnum {
-  val Advance, Reselect = Value
+// Horizontal microcode: a program is a sequence of fixed-size MicroWords,
+// each holding one slot per element the decoder drives, side by side.
+// A word is held for `length` cycles; within those cycles every strided
+// field advances by its stride once per cycle (modulo the field width, so
+// an all-ones stride steps backwards by one). Nothing is derived inside
+// the decoder -- every cross-element timing relationship (e.g. the weight
+// port shadowing a WeightBuffer read by its readLatency) is the program's
+// job, expressed by placing the right slot in the right word.
+
+// Microcode slot for a buffer read (WeightBuffer, Accumulator drain).
+class ReadSlot(addrWidth: Int, shiftWidth: Int, groupShiftWidth: Int) extends Bundle {
+  val en = Bool()
+  val addr = UInt(addrWidth.W)
+  val addrStride = UInt(addrWidth.W)
+  val shiftAmt = UInt(shiftWidth.W)
+  val shiftStride = UInt(shiftWidth.W)
+  val groupShift = UInt(groupShiftWidth.W)
 }
 
-// `destination` is deliberately not a field here: today every source has
-// exactly one legal destination (WeightBufferRead -> SystolicWeightPort,
-// ActivationBufferRead -> SystolicOperandPort, AccumulatorRead ->
-// RequantizerIn), so it would carry no information. It would need to be
-// reintroduced if a source ever gains more than one legal destination.
-object DecoderSource extends ChiselEnum {
-  val WeightBufferRead, ActivationBufferRead, AccumulatorRead, Halt = Value
+// ActivationBuffer read. The line-buffer shiftIn is disabled along with
+// ActivationBuffer's line buffer (im2col is now done by accumulating kn2row).
+// // ActivationBuffer read: adds the line-buffer shiftIn, held for the whole
+// // word. A RESELECT sweep (shiftIn only on its last step) is therefore two
+// // words: length-1 cycles with shiftIn=0, then 1 cycle with shiftIn=1.
+class ActivationReadSlot(addrWidth: Int, shiftWidth: Int, groupShiftWidth: Int)
+    extends ReadSlot(addrWidth, shiftWidth, groupShiftWidth) {
+  // val shiftIn = Bool()
 }
 
-class Instruction(cfg: DecoderConfig) extends Bundle {
-  val source = DecoderSource()
-  val op = DecoderOp()
-  val baseAddr = UInt(cfg.maxAddrWidth.W)
-  val baseShiftAmt = UInt(cfg.maxShiftWidth.W)
-  val groupShift = UInt(cfg.maxGroupShiftWidth.W)
-  val length = UInt(cfg.lengthWidth.W)
+class WriteAddrSlot(addrWidth: Int) extends Bundle {
+  val addr = UInt(addrWidth.W)
+  val addrStride = UInt(addrWidth.W)
 }
 
-// programLength: how many instructions the program store holds.
-// maxRunLength: the largest `length` (steps) any single instruction can
-// specify -- sizes the `length` field's width.
+// Accumulator write side: its strobe is self-timed (resultIn.valid), so
+// only the address and whether to add to or overwrite the row.
+class AccWriteSlot(addrWidth: Int) extends WriteAddrSlot(addrWidth) {
+  val accumulate = Bool()
+}
+
+// Buffer write (WeightBuffer, ActivationBuffer): the program decides when
+// and where; the data comes from the host's data port in that same cycle.
+class WriteSlot(addrWidth: Int) extends WriteAddrSlot(addrWidth) {
+  val en = Bool()
+}
+
+// Weight port: has no valid of its own, so it carries its own strobe, plus
+// which of the two weight register slots to write.
+class WritePortSlot(addrWidth: Int) extends WriteSlot(addrWidth) {
+  val slot = Bool()
+}
+
+// Compute unit: which weight slot the operand arriving on operandIn this
+// cycle uses (HasStationaryWeights.weightSelect).
+class ComputeSlot extends Bundle {
+  val weightSelect = Bool()
+}
+
+class MicroWord(cfg: DecoderConfig) extends Bundle {
+  val wbRead = new ReadSlot(
+    cfg.weightBuffer.sram.addrWidth,
+    cfg.weightBuffer.adapter.shiftWidth,
+    cfg.weightBuffer.adapter.groupShiftWidth,
+  )
+  val wbWrite = new WriteSlot(cfg.weightBuffer.sram.addrWidth)
+  val weightPort = new WritePortSlot(cfg.weightPortAddrWidth)
+  val abWrite = new WriteSlot(cfg.activationBuffer.sram.addrWidth)
+  val abRead = new ActivationReadSlot(
+    cfg.activationBuffer.sram.addrWidth,
+    cfg.activationBuffer.adapter.shiftWidth,
+    cfg.activationBuffer.adapter.groupShiftWidth,
+  )
+  val compute = new ComputeSlot
+  val accWrite = new AccWriteSlot(cfg.accumulator.sram.addrWidth)
+  val accRead = new ReadSlot(
+    cfg.accumulator.sram.addrWidth,
+    cfg.accumulator.adapter.shiftWidth,
+    cfg.accumulator.adapter.groupShiftWidth,
+  )
+  val length = UInt(cfg.lengthWidth.W) // cycles this word is held, must be >= 1
+  val halt = Bool() // stop after this word's last cycle
+}
+
+// Per-cycle resolved control signals (strides already applied).
+class ReadCtrl(addrWidth: Int, shiftWidth: Int, groupShiftWidth: Int) extends Bundle {
+  val en = Bool()
+  val addr = UInt(addrWidth.W)
+  val shiftAmt = UInt(shiftWidth.W)
+  val groupShift = UInt(groupShiftWidth.W)
+}
+
+class ActivationReadCtrl(addrWidth: Int, shiftWidth: Int, groupShiftWidth: Int)
+    extends ReadCtrl(addrWidth, shiftWidth, groupShiftWidth) {
+  // val shiftIn = Bool() // line buffer disabled, see ActivationReadSlot
+}
+
+class WriteCtrl(addrWidth: Int) extends Bundle {
+  val en = Bool()
+  val addr = UInt(addrWidth.W)
+}
+
+class WritePortCtrl(addrWidth: Int) extends WriteCtrl(addrWidth) {
+  val slot = Bool()
+}
+
+class AccWriteCtrl(addrWidth: Int) extends Bundle {
+  val addr = UInt(addrWidth.W)
+  val accumulate = Bool()
+}
+
+// programLength: how many MicroWords the program store holds.
+// maxRunLength: the largest `length` any single word can specify.
 case class DecoderConfig(
   weightBuffer: WeightBufferConfig,
   activationBuffer: ActivationBufferConfig,
@@ -49,25 +129,11 @@ case class DecoderConfig(
     "all three buffers must share the same ComputeUnitConfig"
   )
 
-  val maxAddrWidth: Int =
-    Seq(weightBuffer.sram.addrWidth, activationBuffer.sram.addrWidth, accumulator.sram.addrWidth).max
-  val maxShiftWidth: Int =
-    Seq(weightBuffer.adapter.shiftWidth, activationBuffer.adapter.shiftWidth, accumulator.adapter.shiftWidth).max
-  val maxGroupShiftWidth: Int = Seq(
-    weightBuffer.adapter.groupShiftWidth,
-    activationBuffer.adapter.groupShiftWidth,
-    accumulator.adapter.groupShiftWidth,
-  ).max
+  // matches HasStationaryWeights' weightWriteAddr for a compute unit whose
+  // weightTotalBeats is numInputs (SystolicArray)
+  val weightPortAddrWidth: Int = math.max(1, log2Ceil(weightBuffer.cu.numInputs))
   val lengthWidth: Int = log2Ceil(maxRunLength + 1)
-  val instrIdxWidth: Int = math.max(1, log2Ceil(programLength))
-
-  // fixed per-(source,destination) delay table: today's only legal
-  // non-self-timed pair is WeightBufferRead -> SystolicWeightPort (the
-  // weight port has no valid of its own -- see HasStationaryWeights).
-  // Self-timed destinations (ActivationBufferRead/AccumulatorRead's
-  // targets) need no entry here: their own buffer's Valid output already
-  // carries correct timing, independent of the decoder.
-  val weightPortDelay: Int = weightBuffer.readLatency
+  val wordIdxWidth: Int = math.max(1, log2Ceil(programLength))
 }
 
 class DecoderIO(cfg: DecoderConfig) extends Bundle {
@@ -76,91 +142,94 @@ class DecoderIO(cfg: DecoderConfig) extends Bundle {
 
   // program load, host-driven before start
   val progWriteEn = Input(Bool())
-  val progWriteAddr = Input(UInt(cfg.instrIdxWidth.W))
-  val progWriteData = Input(new Instruction(cfg))
+  val progWriteAddr = Input(UInt(cfg.wordIdxWidth.W))
+  val progWriteData = Input(new MicroWord(cfg))
 
-  val wbAddr = Output(UInt(cfg.weightBuffer.sram.addrWidth.W))
-  val wbEn = Output(Bool())
-  val wbShiftAmt = Output(UInt(cfg.weightBuffer.adapter.shiftWidth.W))
-  val wbGroupShift = Output(UInt(cfg.weightBuffer.adapter.groupShiftWidth.W))
-  // fixed-delay-shadowed copy of wbAddr, for the non-self-timed weight
-  // port (compute.weightWriteEn still comes directly from
-  // weightBuffer.io.weightOut.valid, not from here)
-  val weightWriteAddr = Output(UInt(cfg.weightBuffer.sram.addrWidth.W))
-
-  val abAddr = Output(UInt(cfg.activationBuffer.sram.addrWidth.W))
-  val abEn = Output(Bool())
-  val abShiftAmt = Output(UInt(cfg.activationBuffer.adapter.shiftWidth.W))
-  val abGroupShift = Output(UInt(cfg.activationBuffer.adapter.groupShiftWidth.W))
-  val abShiftIn = Output(Bool())
-
-  val accAddr = Output(UInt(cfg.accumulator.sram.addrWidth.W))
-  val accEn = Output(Bool())
-  val accShiftAmt = Output(UInt(cfg.accumulator.adapter.shiftWidth.W))
-  val accGroupShift = Output(UInt(cfg.accumulator.adapter.groupShiftWidth.W))
+  val wbRead = Output(new ReadCtrl(
+    cfg.weightBuffer.sram.addrWidth,
+    cfg.weightBuffer.adapter.shiftWidth,
+    cfg.weightBuffer.adapter.groupShiftWidth,
+  ))
+  val wbWrite = Output(new WriteCtrl(cfg.weightBuffer.sram.addrWidth))
+  val weightPort = Output(new WritePortCtrl(cfg.weightPortAddrWidth))
+  val abWrite = Output(new WriteCtrl(cfg.activationBuffer.sram.addrWidth))
+  val abRead = Output(new ActivationReadCtrl(
+    cfg.activationBuffer.sram.addrWidth,
+    cfg.activationBuffer.adapter.shiftWidth,
+    cfg.activationBuffer.adapter.groupShiftWidth,
+  ))
+  val weightSelect = Output(Bool())
+  val accWrite = Output(new AccWriteCtrl(cfg.accumulator.sram.addrWidth))
+  val accRead = Output(new ReadCtrl(
+    cfg.accumulator.sram.addrWidth,
+    cfg.accumulator.adapter.shiftWidth,
+    cfg.accumulator.adapter.groupShiftWidth,
+  ))
 }
 
 class Decoder(cfg: DecoderConfig) extends Module {
   val io = IO(new DecoderIO(cfg))
 
-  private val prog = Reg(Vec(cfg.programLength, new Instruction(cfg)))
+  private val prog = Reg(Vec(cfg.programLength, new MicroWord(cfg)))
   when(io.progWriteEn) {
     prog(io.progWriteAddr) := io.progWriteData
   }
 
   private val running = RegInit(false.B)
-  private val instrIdx = RegInit(0.U(cfg.instrIdxWidth.W))
-  private val offset = RegInit(0.U(cfg.lengthWidth.W))
+  private val wordIdx = RegInit(0.U(cfg.wordIdxWidth.W))
+  private val step = RegInit(0.U(cfg.lengthWidth.W))
 
-  private val instr = prog(instrIdx)
-  private val isHalt = instr.source === DecoderSource.Halt
-  private val atLastStep = offset === (instr.length - 1.U)
+  private val word = prog(wordIdx)
+  private val atLastStep = step === (word.length - 1.U)
 
   when(io.start) {
     running := true.B
-    instrIdx := 0.U
-    offset := 0.U
+    wordIdx := 0.U
+    step := 0.U
   }.elsewhen(running) {
-    when(isHalt) {
-      running := false.B
-    }.elsewhen(atLastStep) {
-      offset := 0.U
-      instrIdx := instrIdx + 1.U
+    when(atLastStep) {
+      step := 0.U
+      wordIdx := wordIdx + 1.U
+      when(word.halt) { running := false.B }
     }.otherwise {
-      offset := offset + 1.U
+      step := step + 1.U
     }
   }
   io.running := running
 
-  private val active = running && !isHalt
-  private val advancing = instr.op === DecoderOp.Advance
-  private val addr = Mux(advancing, instr.baseAddr + offset, instr.baseAddr)
-  private val shiftAmt = Mux(advancing, instr.baseShiftAmt, instr.baseShiftAmt + offset)
+  // every strided field restarts from its word's base value on a word
+  // boundary; an adder per field instead of a base + step * stride multiply
+  private val restart = io.start || (running && atLastStep)
+  private def strided(base: UInt, stride: UInt): UInt = {
+    val offset = RegInit(0.U(base.getWidth.W))
+    when(restart) { offset := 0.U }.elsewhen(running) { offset := offset + stride }
+    base + offset
+  }
 
-  private val isWb = active && instr.source === DecoderSource.WeightBufferRead
-  private val isAb = active && instr.source === DecoderSource.ActivationBufferRead
-  private val isAcc = active && instr.source === DecoderSource.AccumulatorRead
+  private def resolveRead(slot: ReadSlot, ctrl: ReadCtrl): Unit = {
+    ctrl.en := running && slot.en
+    ctrl.addr := strided(slot.addr, slot.addrStride)
+    ctrl.shiftAmt := strided(slot.shiftAmt, slot.shiftStride)
+    ctrl.groupShift := slot.groupShift
+  }
 
-  io.wbAddr := addr(cfg.weightBuffer.sram.addrWidth - 1, 0)
-  io.wbEn := isWb
-  io.wbShiftAmt := shiftAmt(cfg.weightBuffer.adapter.shiftWidth - 1, 0)
-  io.wbGroupShift := instr.groupShift(cfg.weightBuffer.adapter.groupShiftWidth - 1, 0)
-  io.weightWriteAddr :=
-    ShiftRegister(io.wbAddr, cfg.weightPortDelay, 0.U(cfg.weightBuffer.sram.addrWidth.W), true.B)
+  resolveRead(word.wbRead, io.wbRead)
+  resolveRead(word.abRead, io.abRead)
+  // io.abRead.shiftIn := running && word.abRead.en && word.abRead.shiftIn // line buffer disabled
+  resolveRead(word.accRead, io.accRead)
 
-  io.abAddr := addr(cfg.activationBuffer.sram.addrWidth - 1, 0)
-  io.abEn := isAb
-  io.abShiftAmt := shiftAmt(cfg.activationBuffer.adapter.shiftWidth - 1, 0)
-  io.abGroupShift := instr.groupShift(cfg.activationBuffer.adapter.groupShiftWidth - 1, 0)
-  // ADVANCE: every step is a genuinely new row, always shift it in.
-  // RESELECT: only the instruction's LAST step commits the shift (the
-  // row at baseAddr becomes resident history right before the next
-  // instruction moves past it) -- every earlier step must leave history
-  // untouched so they all see the same window, just different columns.
-  io.abShiftIn := isAb && (advancing || atLastStep)
+  private def resolveWrite(slot: WriteSlot, ctrl: WriteCtrl): Unit = {
+    ctrl.en := running && slot.en
+    ctrl.addr := strided(slot.addr, slot.addrStride)
+  }
 
-  io.accAddr := addr(cfg.accumulator.sram.addrWidth - 1, 0)
-  io.accEn := isAcc
-  io.accShiftAmt := shiftAmt(cfg.accumulator.adapter.shiftWidth - 1, 0)
-  io.accGroupShift := instr.groupShift(cfg.accumulator.adapter.groupShiftWidth - 1, 0)
+  resolveWrite(word.wbWrite, io.wbWrite)
+  resolveWrite(word.abWrite, io.abWrite)
+  resolveWrite(word.weightPort, io.weightPort)
+  io.weightPort.slot := word.weightPort.slot
+
+  io.weightSelect := running && word.compute.weightSelect
+
+  io.accWrite.addr := strided(word.accWrite.addr, word.accWrite.addrStride)
+  io.accWrite.accumulate := running && word.accWrite.accumulate
 }

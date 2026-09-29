@@ -9,32 +9,30 @@ case class XccelConfig(
   activationBuffer: ActivationBufferConfig,
   accumulator: AccumulatorConfig,
   requantizedWidth: Int,
+  programLength: Int,
+  maxRunLength: Int,
 ) {
   require(weightBuffer.cu == cu, "weightBuffer must share this Xccel's ComputeUnitConfig")
   require(activationBuffer.cu == cu, "activationBuffer must share this Xccel's ComputeUnitConfig")
   require(accumulator.cu == cu, "accumulator must share this Xccel's ComputeUnitConfig")
-  require(
-    weightBuffer.tiles == 1,
-    "Xccel's schedule only knows how to stream a single resident weight tile" +
-      " (pc directly indexes rows 0..numInputs-1); tiles>1 needs a real tile-select, not built here"
-  )
-  require(
-    accumulator.depth >= activationBuffer.depth,
-    "Accumulator needs room for at least one result per streamed sample"
-  )
 
-  val numSamples: Int = activationBuffer.depth
-  val latency: Int = cu.numInputs + cu.numOutputs - 1
   val requantizer: RequantizerConfig = RequantizerConfig(cu.numOutputs, cu.outputWidth, requantizedWidth)
+  val decoder: DecoderConfig = DecoderConfig(weightBuffer, activationBuffer, accumulator, programLength, maxRunLength)
 }
 
 class XccelIO(cfg: XccelConfig) extends Bundle {
   val start = Input(Bool())
-  val stop = Input(Bool())
   val running = Output(Bool())
 
-  // host-facing load ports -- only take effect outside each buffer's own
-  // scheduled read window
+  // microcode load, host-driven before start
+  val progWriteEn = Input(Bool())
+  val progWriteAddr = Input(UInt(cfg.decoder.wordIdxWidth.W))
+  val progWriteData = Input(new MicroWord(cfg.decoder))
+
+  // host-facing load ports. Before start (running=0) the host writes with
+  // its own addr/en. While running, only the data ports are used: the
+  // program's wbWrite/abWrite slots give addr/en, and the host must present
+  // that cycle's data on wbWriteData/abWriteData.
   val wbWriteAddr = Input(UInt(cfg.weightBuffer.sram.addrWidth.W))
   val wbWriteEn = Input(Bool())
   val wbWriteData = Input(Vec(cfg.weightBuffer.totalWordsPerRow, UInt(cfg.cu.weightWidth.W)))
@@ -43,8 +41,8 @@ class XccelIO(cfg: XccelConfig) extends Bundle {
   val abWriteEn = Input(Bool())
   val abWriteData = Input(Vec(cfg.activationBuffer.totalWordsPerRow, UInt(cfg.cu.inputWidth.W)))
 
-  // Accumulator's drain -- always available (OneR1W has its own
-  // independent read bus, so it never needs to share with the schedule)
+  // host drain of Accumulator -- same rule, yields to the program's
+  // accRead slot whenever that slot is enabled
   val accReadAddr = Input(UInt(cfg.accumulator.sram.addrWidth.W))
   val accReadEn = Input(Bool())
   val accumOut = Valid(Vec(cfg.cu.numOutputs, UInt(cfg.requantizedWidth.W)))
@@ -53,21 +51,12 @@ class XccelIO(cfg: XccelConfig) extends Bundle {
 class Xccel(cfg: XccelConfig) extends Module {
   val io = IO(new XccelIO(cfg))
 
-  private val wbAddrW = cfg.weightBuffer.sram.addrWidth
-  private val abAddrW = cfg.activationBuffer.sram.addrWidth
-  private val accAddrW = cfg.accumulator.sram.addrWidth
-
-  private val pc = Module(new PC())
-  pc.io.start := io.start
-  pc.io.stop := io.stop
-  io.running := pc.io.running
-
-  private val pcVal = pc.io.pc
-  private val numInputsU = cfg.cu.numInputs.U
-  private val activationEnd = (cfg.cu.numInputs + cfg.numSamples).U
-
-  private val weightLoadPhase = pc.io.running && pcVal < numInputsU
-  private val activationPhase = pc.io.running && pcVal >= numInputsU && pcVal < activationEnd
+  private val decoder = Module(new Decoder(cfg.decoder))
+  decoder.io.start := io.start
+  decoder.io.progWriteEn := io.progWriteEn
+  decoder.io.progWriteAddr := io.progWriteAddr
+  decoder.io.progWriteData := io.progWriteData
+  io.running := decoder.io.running
 
   private val weightBuffer = Module(new WeightBuffer(cfg.weightBuffer))
   private val activationBuffer = Module(new ActivationBuffer(cfg.activationBuffer))
@@ -75,49 +64,55 @@ class Xccel(cfg: XccelConfig) extends Module {
   private val accumulator = Module(new Accumulator(cfg.accumulator))
   private val requantizer = Module(new Requantizer(cfg.requantizer))
 
-  // -- weight load: WeightBuffer's shared bus is either the schedule's
-  // own read request, or the host's write port, whichever applies
-  weightBuffer.io.addr := Mux(weightLoadPhase, pcVal(wbAddrW - 1, 0), io.wbWriteAddr)
-  weightBuffer.io.en := Mux(weightLoadPhase, true.B, io.wbWriteEn)
-  weightBuffer.io.wen := Mux(weightLoadPhase, false.B, true.B)
+  // -- WeightBuffer: reads from the program; writes from the program while
+  // running (data from the host) or from the host before start. With a
+  // OneRW SRAM reads and writes share one port (a write in a cycle with a
+  // read is dropped); OneR1W/TwoRW give each its own.
+  private val wb = decoder.io.wbRead
+  weightBuffer.io.readAddr := wb.addr
+  weightBuffer.io.readEn := wb.en
+  weightBuffer.io.writeAddr := Mux(decoder.io.running, decoder.io.wbWrite.addr, io.wbWriteAddr)
+  weightBuffer.io.writeEn := Mux(decoder.io.running, decoder.io.wbWrite.en, io.wbWriteEn)
   weightBuffer.io.wdata := io.wbWriteData
-  weightBuffer.io.shiftAmt := 0.U
-  weightBuffer.io.groupShift := 0.U
+  weightBuffer.io.shiftAmt := wb.shiftAmt
+  weightBuffer.io.groupShift := wb.groupShift
 
-  compute.weightWriteEn := weightBuffer.io.weightOut.valid
+  // the weight port has no valid of its own: its strobe and row address
+  // come straight from the program's weightPort slot
+  compute.weightWriteEn := decoder.io.weightPort.en
+  compute.weightWriteAddr := decoder.io.weightPort.addr
   compute.weightWriteData := weightBuffer.io.weightOut.bits
-  compute.weightWriteAddr :=
-    ShiftRegister(weightBuffer.io.addr, cfg.weightBuffer.readLatency, 0.U(wbAddrW.W), true.B)
+  compute.weightWriteSlot := decoder.io.weightPort.slot
+  compute.weightSelect := decoder.io.weightSelect
 
-  // -- activation sweep: same host-vs-schedule mux, then a direct
+  // -- ActivationBuffer: same read/write arrangement, then a direct
   // connect into the compute unit (shapes match exactly)
-  activationBuffer.io.addr := Mux(activationPhase, (pcVal - numInputsU)(abAddrW - 1, 0), io.abWriteAddr)
-  activationBuffer.io.en := Mux(activationPhase, true.B, io.abWriteEn)
-  activationBuffer.io.wen := Mux(activationPhase, false.B, true.B)
+  private val ab = decoder.io.abRead
+  activationBuffer.io.readAddr := ab.addr
+  activationBuffer.io.readEn := ab.en
+  activationBuffer.io.writeAddr := Mux(decoder.io.running, decoder.io.abWrite.addr, io.abWriteAddr)
+  activationBuffer.io.writeEn := Mux(decoder.io.running, decoder.io.abWrite.en, io.abWriteEn)
   activationBuffer.io.wdata := io.abWriteData
-  activationBuffer.io.shiftAmt := 0.U
-  activationBuffer.io.groupShift := 0.U
-  activationBuffer.io.shiftIn := true.B
+  activationBuffer.io.shiftAmt := ab.shiftAmt
+  activationBuffer.io.groupShift := ab.groupShift
+  // activationBuffer.io.shiftIn := ab.shiftIn // line buffer disabled (accumulating kn2row)
 
   compute.io.operandIn <> activationBuffer.io.operandOut
 
-  // -- resultOut -> Accumulator: writeAddr is the sample index, recovered
-  // by delaying the activation-phase address by the exact fixed latency
-  // from an ActivationBuffer read request to its corresponding resultOut
-  // beat (abReadLatency + systolic latency) -- same trick
-  // WeightBufferSystolicHarness uses for weightWriteAddr, garbage outside
-  // the activation window is harmless since it's only ever consumed on
-  // cycles Accumulator itself gates by resultIn.valid
+  // -- resultOut -> Accumulator: the write strobe is resultIn.valid
+  // (self-timed), the address and add-vs-overwrite come from the program.
+  // An accumulating beat uses Accumulator's read channel, so the program
+  // must not schedule an accRead in the same cycle.
   accumulator.io.resultIn <> compute.io.resultOut
-  private val sampleIndex = (pcVal - numInputsU)(accAddrW - 1, 0)
-  accumulator.io.writeAddr :=
-    ShiftRegister(sampleIndex, cfg.activationBuffer.readLatency + cfg.latency, 0.U(accAddrW.W), true.B)
+  accumulator.io.writeAddr := decoder.io.accWrite.addr
+  accumulator.io.accumulate := decoder.io.accWrite.accumulate
 
-  // -- drain: always available, independent of the schedule (OneR1W)
-  accumulator.io.readAddr := io.accReadAddr
-  accumulator.io.readEn := io.accReadEn
-  accumulator.io.shiftAmt := 0.U
-  accumulator.io.groupShift := 0.U
+  // -- drain: the program's accRead slot, otherwise the host
+  private val acc = decoder.io.accRead
+  accumulator.io.readAddr := Mux(acc.en, acc.addr, io.accReadAddr)
+  accumulator.io.readEn := acc.en || io.accReadEn
+  accumulator.io.shiftAmt := Mux(acc.en, acc.shiftAmt, 0.U)
+  accumulator.io.groupShift := Mux(acc.en, acc.groupShift, 0.U)
 
   requantizer.io.in <> accumulator.io.accOut
   io.accumOut <> requantizer.io.out
