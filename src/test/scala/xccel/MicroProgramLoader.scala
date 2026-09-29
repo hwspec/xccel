@@ -45,6 +45,10 @@ case class CycleControl(
   wbwAddr: Int = 0,
   abwEn: Boolean = false,
   abwAddr: Int = 0,
+  abwFromRequantizer: Boolean = false,
+  accrEn: Boolean = false,
+  accrAddr: Int = 0,
+  requantSet: Int = 0,
   wpEn: Boolean = false,
   wpAddr: Int = 0,
   wpSlot: Boolean = false,
@@ -54,8 +58,8 @@ case class CycleControl(
   accAddr: Int = 0,
   accumulate: Boolean = false,
 ) {
-  def flags = (wbEn, wbwEn, abwEn, wpEn, wpSlot, abEn, weightSelect, accumulate)
-  def addrs = Seq(wbAddr, wpAddr, abAddr, accAddr, wbwAddr, abwAddr)
+  def flags = (wbEn, wbwEn, abwEn, abwFromRequantizer, accrEn, requantSet, wpEn, wpSlot, abEn, weightSelect, accumulate)
+  def addrs = Seq(wbAddr, wpAddr, abAddr, accAddr, wbwAddr, abwAddr, accrAddr)
 }
 
 // A run of cycles folded into one word: `first` plus per-address strides.
@@ -88,7 +92,7 @@ object CycleProgram {
   def load(p: MicroProgramLoader, words: Seq[FoldedWord]): Unit = {
     for ((fw, i) <- words.zipWithIndex) {
       val c = fw.first
-      val Seq(wbS, wpS, abS, accS, wbwS, abwS) = fw.strides
+      val Seq(wbS, wpS, abS, accS, wbwS, abwS, accrS) = fw.strides
       p.word(length = fw.length, halt = i == words.length - 1) { w =>
         def poke(u: UInt, v: Int): Unit = u.poke((BigInt(v) & ((BigInt(1) << u.getWidth) - 1)).U(u.getWidth.W))
         w.wbRead.en.poke(c.wbEn.B)
@@ -109,6 +113,11 @@ object CycleProgram {
         poke(w.wbWrite.addr, c.wbwAddr)
         poke(w.wbWrite.addrStride, wbwS)
         w.abWrite.en.poke(c.abwEn.B)
+        w.abWrite.fromRequantizer.poke(c.abwFromRequantizer.B)
+        w.accRead.en.poke(c.accrEn.B)
+        poke(w.accRead.addr, c.accrAddr)
+        poke(w.accRead.addrStride, accrS)
+        poke(w.requant.paramSet, c.requantSet)
         poke(w.abWrite.addr, c.abwAddr)
         poke(w.abWrite.addrStride, abwS)
       }

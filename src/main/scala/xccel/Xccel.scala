@@ -11,13 +11,24 @@ case class XccelConfig(
   requantizedWidth: Int,
   programLength: Int,
   maxRunLength: Int,
+  requantMultWidth: Int = 16,
+  requantParamSets: Int = 1,
 ) {
   require(weightBuffer.cu == cu, "weightBuffer must share this Xccel's ComputeUnitConfig")
   require(activationBuffer.cu == cu, "activationBuffer must share this Xccel's ComputeUnitConfig")
   require(accumulator.cu == cu, "accumulator must share this Xccel's ComputeUnitConfig")
 
-  val requantizer: RequantizerConfig = RequantizerConfig(cu.numOutputs, cu.outputWidth, requantizedWidth)
-  val decoder: DecoderConfig = DecoderConfig(weightBuffer, activationBuffer, accumulator, programLength, maxRunLength)
+  val requantizer: RequantizerConfig =
+    RequantizerConfig(cu.numOutputs, cu.outputWidth, requantizedWidth, requantMultWidth, requantParamSets)
+
+  // Layer-to-layer path (Requantizer output -> ActivationBuffer write) exists
+  // only when a requantized value is exactly one ActivationBuffer element and
+  // one requantized beat fits in one ActivationBuffer row (spare lanes are
+  // written as zero). Otherwise abWrite.fromRequantizer has no effect.
+  val feedback: Boolean =
+    requantizedWidth == cu.inputWidth && cu.numOutputs <= activationBuffer.totalWordsPerRow
+  val decoder: DecoderConfig =
+    DecoderConfig(weightBuffer, activationBuffer, accumulator, programLength, maxRunLength, requantParamSets)
 }
 
 class XccelIO(cfg: XccelConfig) extends Bundle {
@@ -45,7 +56,15 @@ class XccelIO(cfg: XccelConfig) extends Bundle {
   // accRead slot whenever that slot is enabled
   val accReadAddr = Input(UInt(cfg.accumulator.sram.addrWidth.W))
   val accReadEn = Input(Bool())
+  // Requantizer parameter set for host drains (while running, the
+  // program's requant slot selects it)
+  val accReadParamSet = Input(UInt(cfg.requantizer.setWidth.W))
   val accumOut = Valid(Vec(cfg.cu.numOutputs, UInt(cfg.requantizedWidth.W)))
+
+  // Requantizer parameter load, host-driven before start
+  val requantParamWriteEn = Input(Bool())
+  val requantParamWriteSet = Input(UInt(cfg.requantizer.setWidth.W))
+  val requantParamWriteData = Input(new RequantParams(cfg.requantizer))
 }
 
 class Xccel(cfg: XccelConfig) extends Module {
@@ -92,7 +111,16 @@ class Xccel(cfg: XccelConfig) extends Module {
   activationBuffer.io.readEn := ab.en
   activationBuffer.io.writeAddr := Mux(decoder.io.running, decoder.io.abWrite.addr, io.abWriteAddr)
   activationBuffer.io.writeEn := Mux(decoder.io.running, decoder.io.abWrite.en, io.abWriteEn)
-  activationBuffer.io.wdata := io.abWriteData
+  // write data: the host's, or the Requantizer output (layer-to-layer path)
+  // when the program's abWrite slot asks for it
+  if (cfg.feedback) {
+    val fromRequantizer = VecInit(Seq.tabulate(cfg.activationBuffer.totalWordsPerRow)(i =>
+      if (i < cfg.cu.numOutputs) requantizer.io.out.bits(i) else 0.U(cfg.cu.inputWidth.W)))
+    activationBuffer.io.wdata :=
+      Mux(decoder.io.running && decoder.io.abWrite.fromRequantizer, fromRequantizer, io.abWriteData)
+  } else {
+    activationBuffer.io.wdata := io.abWriteData
+  }
   activationBuffer.io.shiftAmt := ab.shiftAmt
   activationBuffer.io.groupShift := ab.groupShift
   // activationBuffer.io.shiftIn := ab.shiftIn // line buffer disabled (accumulating kn2row)
@@ -115,5 +143,9 @@ class Xccel(cfg: XccelConfig) extends Module {
   accumulator.io.groupShift := Mux(acc.en, acc.groupShift, 0.U)
 
   requantizer.io.in <> accumulator.io.accOut
+  requantizer.io.paramSet := Mux(decoder.io.running, decoder.io.requantParamSet, io.accReadParamSet)
+  requantizer.io.paramWriteEn := io.requantParamWriteEn
+  requantizer.io.paramWriteSet := io.requantParamWriteSet
+  requantizer.io.paramWriteData := io.requantParamWriteData
   io.accumOut <> requantizer.io.out
 }

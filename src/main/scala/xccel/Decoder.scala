@@ -49,10 +49,25 @@ class WriteSlot(addrWidth: Int) extends WriteAddrSlot(addrWidth) {
   val en = Bool()
 }
 
+// ActivationBuffer write: the data comes from the host, or, with
+// fromRequantizer, from the Requantizer output in that same cycle (the
+// layer-to-layer path: place it accumulator.readLatency after the accRead
+// that drains the row).
+class ActivationWriteSlot(addrWidth: Int) extends WriteSlot(addrWidth) {
+  val fromRequantizer = Bool()
+}
+
 // Weight port: has no valid of its own, so it carries its own strobe, plus
 // which of the two weight register slots to write.
 class WritePortSlot(addrWidth: Int) extends WriteSlot(addrWidth) {
   val slot = Bool()
+}
+
+// Requantizer: which parameter set the beat entering the Requantizer this
+// cycle uses (aligned with Accumulator's accOut, i.e. accumulator.readLatency
+// after the accRead).
+class RequantSlot(setWidth: Int) extends Bundle {
+  val paramSet = UInt(setWidth.W)
 }
 
 // Compute unit: which weight slot the operand arriving on operandIn this
@@ -69,7 +84,7 @@ class MicroWord(cfg: DecoderConfig) extends Bundle {
   )
   val wbWrite = new WriteSlot(cfg.weightBuffer.sram.addrWidth)
   val weightPort = new WritePortSlot(cfg.weightPortAddrWidth)
-  val abWrite = new WriteSlot(cfg.activationBuffer.sram.addrWidth)
+  val abWrite = new ActivationWriteSlot(cfg.activationBuffer.sram.addrWidth)
   val abRead = new ActivationReadSlot(
     cfg.activationBuffer.sram.addrWidth,
     cfg.activationBuffer.adapter.shiftWidth,
@@ -82,6 +97,7 @@ class MicroWord(cfg: DecoderConfig) extends Bundle {
     cfg.accumulator.adapter.shiftWidth,
     cfg.accumulator.adapter.groupShiftWidth,
   )
+  val requant = new RequantSlot(cfg.requantSetWidth)
   val length = UInt(cfg.lengthWidth.W) // cycles this word is held, must be >= 1
   val halt = Bool() // stop after this word's last cycle
 }
@@ -104,6 +120,10 @@ class WriteCtrl(addrWidth: Int) extends Bundle {
   val addr = UInt(addrWidth.W)
 }
 
+class ActivationWriteCtrl(addrWidth: Int) extends WriteCtrl(addrWidth) {
+  val fromRequantizer = Bool()
+}
+
 class WritePortCtrl(addrWidth: Int) extends WriteCtrl(addrWidth) {
   val slot = Bool()
 }
@@ -121,6 +141,7 @@ case class DecoderConfig(
   accumulator: AccumulatorConfig,
   programLength: Int,
   maxRunLength: Int,
+  requantParamSets: Int = 1,
 ) {
   require(programLength > 0, "programLength must be positive")
   require(maxRunLength > 0, "maxRunLength must be positive")
@@ -133,6 +154,7 @@ case class DecoderConfig(
   // weightTotalBeats is numInputs (SystolicArray)
   val weightPortAddrWidth: Int = math.max(1, log2Ceil(weightBuffer.cu.numInputs))
   val lengthWidth: Int = log2Ceil(maxRunLength + 1)
+  val requantSetWidth: Int = math.max(1, log2Ceil(requantParamSets))
   val wordIdxWidth: Int = math.max(1, log2Ceil(programLength))
 }
 
@@ -152,13 +174,14 @@ class DecoderIO(cfg: DecoderConfig) extends Bundle {
   ))
   val wbWrite = Output(new WriteCtrl(cfg.weightBuffer.sram.addrWidth))
   val weightPort = Output(new WritePortCtrl(cfg.weightPortAddrWidth))
-  val abWrite = Output(new WriteCtrl(cfg.activationBuffer.sram.addrWidth))
+  val abWrite = Output(new ActivationWriteCtrl(cfg.activationBuffer.sram.addrWidth))
   val abRead = Output(new ActivationReadCtrl(
     cfg.activationBuffer.sram.addrWidth,
     cfg.activationBuffer.adapter.shiftWidth,
     cfg.activationBuffer.adapter.groupShiftWidth,
   ))
   val weightSelect = Output(Bool())
+  val requantParamSet = Output(UInt(cfg.requantSetWidth.W))
   val accWrite = Output(new AccWriteCtrl(cfg.accumulator.sram.addrWidth))
   val accRead = Output(new ReadCtrl(
     cfg.accumulator.sram.addrWidth,
@@ -225,10 +248,12 @@ class Decoder(cfg: DecoderConfig) extends Module {
 
   resolveWrite(word.wbWrite, io.wbWrite)
   resolveWrite(word.abWrite, io.abWrite)
+  io.abWrite.fromRequantizer := word.abWrite.fromRequantizer
   resolveWrite(word.weightPort, io.weightPort)
   io.weightPort.slot := word.weightPort.slot
 
   io.weightSelect := running && word.compute.weightSelect
+  io.requantParamSet := Mux(running, word.requant.paramSet, 0.U)
 
   io.accWrite.addr := strided(word.accWrite.addr, word.accWrite.addrStride)
   io.accWrite.accumulate := running && word.accWrite.accumulate

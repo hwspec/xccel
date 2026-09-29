@@ -40,6 +40,7 @@ class DecoderTest extends AnyFlatSpec with ChiselScalatestTester {
           w.abWrite.en.poke(true.B)
           w.abWrite.addr.poke(4.U)
           w.abWrite.addrStride.poke(2.U)
+          w.abWrite.fromRequantizer.poke(true.B)
         }
         // w1: ActivationBuffer sweeping shiftAmt 0,1 at a fixed addr, in
         // parallel with the weight port writing slot 1, addr 0,1
@@ -84,6 +85,7 @@ class DecoderTest extends AnyFlatSpec with ChiselScalatestTester {
           c.io.wbWrite.addr.expect((3 - i).U)
           c.io.abWrite.en.expect(true.B)
           c.io.abWrite.addr.expect((4 + 2 * i).U)
+          c.io.abWrite.fromRequantizer.expect(true.B)
           c.io.abRead.en.expect(false.B)
           c.io.weightPort.en.expect(false.B)
           c.io.accRead.en.expect(false.B)

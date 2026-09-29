@@ -2,3 +2,4 @@ out/
 .bloop/
 .metals/
 .bsp/
+build/

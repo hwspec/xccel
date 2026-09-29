@@ -31,6 +31,8 @@ class XccelTest extends AnyFlatSpec with ChiselScalatestTester {
 
       c.io.start.poke(false.B)
       c.io.progWriteEn.poke(false.B)
+      c.io.requantParamWriteEn.poke(false.B)
+      c.io.accReadParamSet.poke(0.U)
       c.io.wbWriteEn.poke(false.B)
       c.io.abWriteEn.poke(false.B)
       c.io.accReadEn.poke(false.B)
@@ -258,6 +260,8 @@ class XccelTest extends AnyFlatSpec with ChiselScalatestTester {
     test(new Xccel(cfg)) { c =>
       c.io.start.poke(false.B)
       c.io.progWriteEn.poke(false.B)
+      c.io.requantParamWriteEn.poke(false.B)
+      c.io.accReadParamSet.poke(0.U)
       c.io.accReadEn.poke(false.B)
       c.io.abWriteEn.poke(false.B)
 
@@ -368,6 +372,8 @@ class XccelTest extends AnyFlatSpec with ChiselScalatestTester {
     test(new Xccel(cfg)) { c =>
       c.io.start.poke(false.B)
       c.io.progWriteEn.poke(false.B)
+      c.io.requantParamWriteEn.poke(false.B)
+      c.io.accReadParamSet.poke(0.U)
       c.io.wbWriteEn.poke(false.B)
       c.io.abWriteEn.poke(false.B)
       c.io.accReadEn.poke(false.B)
@@ -392,6 +398,135 @@ class XccelTest extends AnyFlatSpec with ChiselScalatestTester {
         c.clock.step(accCfg.readLatency)
         c.io.accumOut.valid.expect(true.B)
         for ((v, i) <- exp.zipWithIndex) c.io.accumOut.bits(i).expect(toU(v, cu.outputWidth))
+      }
+      c.io.accReadEn.poke(false.B)
+    }
+  }
+
+  // ---- layer-to-layer path -----------------------------------------------
+  for (portType <- Seq(BankPortType.OneRW, BankPortType.OneR1W))
+  it should s"chain two layers on chip: drain layer 1 through the Requantizer into ActivationBuffer, then run layer 2 on it (AB $portType)" in {
+    // Two quantized matmuls (1x1 convs) on a 4x4 array, N samples, 20-bit
+    // accumulators and 8-bit activations:
+    //   A1 = requant1(X.W1)   per-lane bias and scale, ReLU    (Requantizer set 1)
+    //   Y2 = requant0(A1.W2)  per-lane bias and scale, INT8    (Requantizer set 0)
+    // A1 never leaves the chip: the program drains layer 1 with accRead,
+    // selects set 1 with its requant slot, and writes the result back with
+    // abWrite.fromRequantizer. The host drains Y2 with set 0.
+    val R = 4; val C = 4; val N = 3
+    val cu = ComputeUnitConfig(numInputs = R, numOutputs = C, inputWidth = 8, weightWidth = 8, outputWidth = 20)
+    val wbCfg = WeightBufferConfig(cu, numBanks = C, wordsPerBank = 1, tiles = 2, readLatency = 2, writeLatency = 2)
+    val abCfg = ActivationBufferConfig(cu, numBanks = R, wordsPerBank = 1, depth = 2 * N,
+      readLatency = 1, writeLatency = 1, portType = portType)
+    val accCfg = AccumulatorConfig(cu, numBanks = C, wordsPerBank = 1, depth = 2 * N, readLatency = 2, writeLatency = 2)
+    val latency = R + C - 1
+
+    val rnd = new scala.util.Random(3)
+    val x = Seq.fill(N, R)(rnd.nextInt(15) - 7)
+    val w1 = Seq.fill(R, C)(rnd.nextInt(15) - 7)
+    val w2 = Seq.fill(C, C)(rnd.nextInt(15) - 7)
+    def matmul(a: Seq[Seq[Int]], b: Seq[Seq[Int]]) = a.map(row => b.head.indices.map(j => row.indices.map(i => row(i) * b(i)(j)).sum))
+    case class Params(bias: Seq[Int], mult: Seq[Int], shift: Seq[Int], lo: Int, hi: Int)
+    val set1 = Params(bias = Seq(10, -20, 5, 0), mult = Seq(3, 5, 1, 7), shift = Seq(3, 4, 1, 5), lo = 0, hi = 127) // ReLU
+    val set0 = Params(bias = Seq(-50, 0, 300, 7), mult = Seq(1, 3, 5, 1), shift = Seq(4, 6, 7, 3), lo = -128, hi = 127)
+    def requant(v: Seq[Seq[Int]], p: Params) = v.map(_.zipWithIndex.map { case (a, i) =>
+      val prod = BigInt(a + p.bias(i)) * p.mult(i)
+      val half = if (p.shift(i) == 0) BigInt(0) else BigInt(1) << (p.shift(i) - 1)
+      val r = if (p.shift(i) == 0) prod else (if (prod < 0) prod + half - 1 else prod + half) >> p.shift(i)
+      r.max(p.lo).min(p.hi).toInt
+    })
+    val a1 = requant(matmul(x, w1), set1)
+    val y2 = requant(matmul(a1, w2), set0)
+    assert(a1.flatten.exists(_ > 0) && a1.flatten.contains(0), "layer 1 should exercise both ReLU sides")
+
+    // WeightBuffer rows 0..R-1 = W1 (slot 0), R..2R-1 = W2 (slot 1), both
+    // loaded at the start. ActivationBuffer rows 0..N-1 = X, N..2N-1 = Y1.
+    // Accumulator rows 0..N-1 = Y1, N..2N-1 = Y2.
+    val s0 = wbCfg.readLatency + 1 - abCfg.readLatency
+    val lastY1 = s0 + N - 1 + abCfg.readLatency + latency // last layer-1 result beat
+    val drain = lastY1 + accCfg.commitLatency // first accRead of Y1
+    val lastFeedback = drain + N - 1 + accCfg.readLatency // last abWrite of Y1
+    val firstFeedback = drain + accCfg.readLatency
+    // a row written in cycle t is readable from t + writeLatency + 1; with
+    // one shared port (OneRW) layer 2's reads also wait for the last write
+    val s2 = (if (portType == BankPortType.OneRW) lastFeedback else firstFeedback) + abCfg.writeLatency + 1
+    val total = s2 + N - 1 + abCfg.readLatency + latency + 1
+
+    val cycles = Array.fill(total)(CycleControl())
+    def upd(t: Int)(f: CycleControl => CycleControl): Unit = cycles(t) = f(cycles(t))
+    for (r <- 0 until 2 * R) {
+      upd(r)(_.copy(wbEn = true, wbAddr = r))
+      upd(r + wbCfg.readLatency)(_.copy(wpEn = true, wpAddr = r % R, wpSlot = r >= R))
+    }
+    for (s <- 0 until N) {
+      upd(s0 + s)(_.copy(abEn = true, abAddr = s))
+      upd(s0 + s + abCfg.readLatency + latency)(_.copy(accAddr = s))
+      upd(drain + s)(_.copy(accrEn = true, accrAddr = s))
+      upd(drain + s + accCfg.readLatency)(_.copy(abwEn = true, abwAddr = N + s, abwFromRequantizer = true, requantSet = 1))
+      upd(s2 + s)(_.copy(abEn = true, abAddr = N + s))
+      upd(s2 + s + abCfg.readLatency)(_.copy(weightSelect = true))
+      upd(s2 + s + abCfg.readLatency + latency)(_.copy(accAddr = N + s))
+    }
+    val words = CycleProgram.compress(cycles.toSeq, maxRunLength = 16)
+    val cfg = XccelConfig(cu, wbCfg, abCfg, accCfg, requantizedWidth = cu.inputWidth,
+      programLength = words.length, maxRunLength = 16, requantParamSets = 2)
+    assert(cfg.feedback)
+
+    test(new Xccel(cfg)) { c =>
+      c.io.start.poke(false.B)
+      c.io.progWriteEn.poke(false.B)
+      c.io.requantParamWriteEn.poke(false.B)
+      c.io.accReadParamSet.poke(0.U)
+      c.io.accReadEn.poke(false.B)
+      c.io.abWriteEn.poke(false.B)
+      c.io.wbWriteEn.poke(true.B)
+      for ((row, a) <- (w1 ++ w2).zipWithIndex) {
+        c.io.wbWriteAddr.poke(a.U)
+        for ((v, i) <- row.zipWithIndex) c.io.wbWriteData(i).poke(toU(v, cu.weightWidth))
+        c.clock.step()
+      }
+      c.io.wbWriteEn.poke(false.B)
+      c.io.abWriteEn.poke(true.B)
+      for ((row, a) <- x.zipWithIndex) {
+        c.io.abWriteAddr.poke(a.U)
+        for ((v, i) <- row.zipWithIndex) c.io.abWriteData(i).poke(toU(v, cu.inputWidth))
+        c.clock.step()
+      }
+      c.io.abWriteEn.poke(false.B)
+      for ((p, set) <- Seq(set0 -> 0, set1 -> 1)) {
+        c.io.requantParamWriteEn.poke(true.B)
+        c.io.requantParamWriteSet.poke(set.U)
+        for (i <- 0 until C) {
+          c.io.requantParamWriteData.bias(i).poke(p.bias(i).S(cu.outputWidth.W))
+          c.io.requantParamWriteData.mult(i).poke(p.mult(i).U)
+          c.io.requantParamWriteData.shift(i).poke(p.shift(i).U)
+        }
+        c.io.requantParamWriteData.lo.poke(p.lo.S)
+        c.io.requantParamWriteData.hi.poke(p.hi.S)
+        c.clock.step()
+      }
+      c.io.requantParamWriteEn.poke(false.B)
+      // garbage on the host data port during the run: layer 2 must only
+      // ever see the Requantizer's values
+      for (i <- 0 until R) c.io.abWriteData(i).poke(toU(99, cu.inputWidth))
+      c.clock.step(2)
+      CycleProgram.load(new MicroProgramLoader(c.clock, c.io.progWriteEn, c.io.progWriteAddr, c.io.progWriteData), words)
+
+      c.io.start.poke(true.B)
+      c.clock.step()
+      c.io.start.poke(false.B)
+      var n = 0
+      while (c.io.running.peek().litToBoolean) { c.clock.step(); n += 1; assert(n <= total) }
+      assert(n == total)
+      c.clock.step(accCfg.commitLatency)
+
+      c.io.accReadParamSet.poke(0.U)
+      for ((exp, s) <- y2.zipWithIndex) {
+        c.io.accReadAddr.poke((N + s).U)
+        c.io.accReadEn.poke(true.B)
+        c.clock.step(accCfg.readLatency)
+        c.io.accumOut.valid.expect(true.B)
+        for ((v, i) <- exp.zipWithIndex) c.io.accumOut.bits(i).expect(toU(v, cu.inputWidth))
       }
       c.io.accReadEn.poke(false.B)
     }
