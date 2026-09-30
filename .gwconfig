@@ -1,5 +1,5 @@
 name=AxiXccel
 package=xccel
-tests=matmul
-fpgatest=true
+tests=braggnn_inference_opt
+fpgatest=false
 
