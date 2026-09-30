@@ -1,5 +1,5 @@
 name=AxiXccel
 package=xccel
 tests=matmul
-fpgatest=false
+fpgatest=true
 

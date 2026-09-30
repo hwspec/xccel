@@ -1,0 +1,10 @@
+TB_SRCS := $(wildcard tb_*.py)
+TARGETS := $(patsubst %.py,fpga_%.py,$(TB_SRCS))
+
+all: $(TARGETS)
+
+$(TARGETS): fpga_%.py : %.py xccel_bridge.py
+	@conv_cocotb_to_fpga $^ --force
+
+clean:
+	@rm -f fpga_*.py
