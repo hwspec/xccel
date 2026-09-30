@@ -1,3 +1,3 @@
-[submodule "chisel-axi-utils"]
-	path = chisel-axi-utils
-	url = https://github.com/hwspec/chisel-axi-utils.git
+[submodule "garageworks"]
+	path = garageworks
+	url = https://github.com/hwspec/garageworks.git

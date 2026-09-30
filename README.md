@@ -6,10 +6,14 @@ The user (whichever the human or AI agents) can specify the number of SRAMs and 
 Moreover, the user can replace a compute unit with their IP such as systolic array, reduction tree, and vector engine.
 It does not have any caches, reservation station, and arbiters inside the accelerator since it adopts deterministic dataflow architecture.
 
-## Setup
+## Usage
 
 ```bash
-make -C chisel-axi-utils setup
+make -C garageworks setup
+source garageworks/.venv/bin/activate
+./mill runMain xccel.AxiXccelOpt9x64T
+cd tests
+make braggnn_inference_opt HWMODULENAME=AxiXccelOpt9x64T SIM_BUILD=sim_build_opt9x64t
 ```
 
 ## Design Principle

@@ -8,7 +8,7 @@ val scalatestVersion = "3.2.19"
 object `package` extends SbtModule {
   def scalaVersion = "2.13.18"
 
-  def axiUtilsSources = Task.Sources(moduleDir / "chisel-axi-utils" / "src" / "main" / "scala")
+  def axiUtilsSources = Task.Sources(moduleDir / "garageworks" / "src" / "main" / "scala")
 
   def sources = Task {
     super.sources() ++ axiUtilsSources()
