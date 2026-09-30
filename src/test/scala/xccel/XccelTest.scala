@@ -66,12 +66,12 @@ class XccelTest extends AnyFlatSpec with ChiselScalatestTester {
       // systolic latency numInputs+numOutputs-1)
       val p = new MicroProgramLoader(c.clock, c.io.progWriteEn, c.io.progWriteAddr, c.io.progWriteData)
       // t0-1: read weight rows 0,1
-      p.word(length = 2) { w =>
+      p.word(cycles = 2) { w =>
         w.wbRead.en.poke(true.B)
         w.wbRead.addrStride.poke(1.U)
       }
       // t2-3: read weight rows 2,3; rows 0,1 land on the weight port
-      p.word(length = 2) { w =>
+      p.word(cycles = 2) { w =>
         w.wbRead.en.poke(true.B)
         w.wbRead.addr.poke(2.U)
         w.wbRead.addrStride.poke(1.U)
@@ -79,7 +79,7 @@ class XccelTest extends AnyFlatSpec with ChiselScalatestTester {
         w.weightPort.addrStride.poke(1.U)
       }
       // t4-5: stream samples 0,1; rows 2,3 land on the weight port
-      p.word(length = 2) { w =>
+      p.word(cycles = 2) { w =>
         w.abRead.en.poke(true.B)
         w.abRead.addrStride.poke(1.U)
         w.weightPort.en.poke(true.B)
@@ -87,10 +87,10 @@ class XccelTest extends AnyFlatSpec with ChiselScalatestTester {
         w.weightPort.addrStride.poke(1.U)
       }
       // t6-9: pipeline fill
-      p.word(length = 4)()
+      p.word(cycles = 4)()
       // t10-11: results for samples 0,1 land in Accumulator rows 0,1
       // (overwrite, accumulate = false)
-      p.word(length = 2, halt = true) { w =>
+      p.word(cycles = 2, halt = true) { w =>
         w.accWrite.addrStride.poke(1.U)
       }
       p.done()

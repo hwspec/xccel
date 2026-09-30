@@ -9,9 +9,9 @@ import chiseltest._
 class MicroProgramLoader(clock: Clock, en: Bool, addr: UInt, data: MicroWord) {
   private var next = 0
 
-  def word(length: Int, halt: Boolean = false)(fill: MicroWord => Unit = _ => ()): Unit = {
+  def word(cycles: Int, halt: Boolean = false)(fill: MicroWord => Unit = _ => ()): Unit = {
     MicroProgramLoader.clear(data)
-    data.length.poke(length.U)
+    data.cycles.poke(cycles.U)
     data.halt.poke(halt.B)
     fill(data)
     addr.poke(next.U)
@@ -74,7 +74,7 @@ case class CycleControl(
 }
 
 // A run of cycles folded into one word: `first` plus per-address strides.
-case class FoldedWord(first: CycleControl, strides: Seq[Int], length: Int)
+case class FoldedWord(first: CycleControl, strides: Seq[Int], cycles: Int)
 
 object CycleProgram {
   // Greedy: extend the current word while every flag is unchanged and every
@@ -83,15 +83,15 @@ object CycleProgram {
     val words = scala.collection.mutable.ArrayBuffer.empty[FoldedWord]
     for (c <- cycles) {
       val extend = words.lastOption.exists { w =>
-        w.length < maxRunLength && w.first.flags == c.flags && {
-          val strides = if (w.length == 1) c.addrs.zip(w.first.addrs).map { case (a, b) => a - b } else w.strides
-          c.addrs.indices.forall(i => c.addrs(i) == w.first.addrs(i) + strides(i) * w.length)
+        w.cycles < maxRunLength && w.first.flags == c.flags && {
+          val strides = if (w.cycles == 1) c.addrs.zip(w.first.addrs).map { case (a, b) => a - b } else w.strides
+          c.addrs.indices.forall(i => c.addrs(i) == w.first.addrs(i) + strides(i) * w.cycles)
         }
       }
       if (extend) {
         val w = words.last
-        val strides = if (w.length == 1) c.addrs.zip(w.first.addrs).map { case (a, b) => a - b } else w.strides
-        words(words.length - 1) = w.copy(strides = strides, length = w.length + 1)
+        val strides = if (w.cycles == 1) c.addrs.zip(w.first.addrs).map { case (a, b) => a - b } else w.strides
+        words(words.length - 1) = w.copy(strides = strides, cycles = w.cycles + 1)
       } else {
         words += FoldedWord(c, Seq.fill(c.addrs.length)(0), 1)
       }
@@ -104,7 +104,7 @@ object CycleProgram {
     for ((fw, i) <- words.zipWithIndex) {
       val c = fw.first
       val Seq(wbS, wpS, abS, accS, wbwS, abwS, accrS, colS, rowS) = fw.strides
-      p.word(length = fw.length, halt = i == words.length - 1) { w =>
+      p.word(cycles = fw.cycles, halt = i == words.length - 1) { w =>
         def poke(u: UInt, v: Int): Unit = u.poke((BigInt(v) & ((BigInt(1) << u.getWidth) - 1)).U(u.getWidth.W))
         w.wbRead.en.poke(c.wbEn.B)
         poke(w.wbRead.addr, c.wbAddr)

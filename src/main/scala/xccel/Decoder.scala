@@ -5,7 +5,7 @@ import chisel3.util._
 
 // Horizontal microcode: a program is a sequence of fixed-size MicroWords,
 // each holding one slot per element the decoder drives, side by side.
-// A word is held for `length` cycles; within those cycles every strided
+// A word is held for `cycles` cycles; within those cycles every strided
 // field advances by its stride once per cycle (modulo the field width, so
 // an all-ones stride steps backwards by one). Nothing is derived inside
 // the decoder -- every cross-element timing relationship (e.g. the weight
@@ -26,7 +26,7 @@ class ReadSlot(addrWidth: Int, shiftWidth: Int, groupShiftWidth: Int) extends Bu
 // ActivationBuffer's line buffer (im2col is now done by accumulating kn2row).
 // // ActivationBuffer read: adds the line-buffer shiftIn, held for the whole
 // // word. A RESELECT sweep (shiftIn only on its last step) is therefore two
-// // words: length-1 cycles with shiftIn=0, then 1 cycle with shiftIn=1.
+// // words: cycles-1 cycles with shiftIn=0, then 1 cycle with shiftIn=1.
 class ActivationReadSlot(addrWidth: Int, shiftWidth: Int, groupShiftWidth: Int)
     extends ReadSlot(addrWidth, shiftWidth, groupShiftWidth) {
   // val shiftIn = Bool()
@@ -139,7 +139,7 @@ class MicroWord(cfg: DecoderConfig) extends Bundle {
   val transposer = new TransposerSlot(cfg.transposerIndexWidth)
   val softmax = new SoftmaxSlot(cfg.softmaxLanesWidth, cfg.softmaxStatWidth, cfg.softmaxRowBeats)
   val residual = new ResidualSlot(cfg.residualSetWidth)
-  val length = UInt(cfg.lengthWidth.W) // cycles this word is held, must be >= 1
+  val cycles = UInt(cfg.cyclesWidth.W) // cycles this word is held, must be >= 1
   val halt = Bool() // stop after this word's last cycle
 }
 
@@ -186,7 +186,7 @@ class AccWriteCtrl(addrWidth: Int) extends Bundle {
 }
 
 // programLength: how many MicroWords the program store holds.
-// maxRunLength: the largest `length` any single word can specify.
+// maxRunLength: the largest `cycles` any single word can specify.
 case class DecoderConfig(
   weightBuffer: WeightBufferConfig,
   activationBuffer: ActivationBufferConfig,
@@ -210,7 +210,7 @@ case class DecoderConfig(
   // matches HasStationaryWeights' weightWriteAddr
   val weightPortAddrWidth: Int =
     math.max(1, log2Ceil(if (weightPortBeats > 0) weightPortBeats else weightBuffer.cu.numInputs))
-  val lengthWidth: Int = log2Ceil(maxRunLength + 1)
+  val cyclesWidth: Int = log2Ceil(maxRunLength + 1)
   val requantSetWidth: Int = math.max(1, log2Ceil(requantParamSets))
   // Transposer is numOutputs x numOutputs (one Requantizer beat per row)
   val transposerIndexWidth: Int = math.max(1, log2Ceil(weightBuffer.cu.numOutputs))
@@ -270,11 +270,11 @@ class Decoder(cfg: DecoderConfig) extends Module {
 
   private val running = RegInit(false.B)
   private val wordIdx = RegInit(0.U(cfg.wordIdxWidth.W))
-  private val step = RegInit(0.U(cfg.lengthWidth.W))
+  private val step = RegInit(0.U(cfg.cyclesWidth.W))
 
   private val nextIdx = Wire(UInt(cfg.wordIdxWidth.W))
   private val word = prog.read(nextIdx)
-  private val atLastStep = step === (word.length - 1.U)
+  private val atLastStep = step === (word.cycles - 1.U)
   nextIdx := Mux(io.start, 0.U, Mux(running && atLastStep, wordIdx + 1.U, wordIdx))
 
   when(io.start) {

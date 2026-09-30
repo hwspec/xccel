@@ -5,7 +5,7 @@ one generated configuration, without running a simulation.
 
 writes <out_prefix>.json ({"cycles", "config", "words": [{field: value}]},
 the MicroWords exactly as loaded, fields at 0 omitted) and <out_prefix>.txt
-(one line per word: index, length, the nonzero fields). out_prefix defaults
+(one line per word: index, cycles, the nonzero fields). out_prefix defaults
 to <generated dir>/program. The build mirrors the test bench: Accumulator read
 model from acc_row_banks, softmax stats, compute arrays and the softmax
 constants from params.json / layout.json.
@@ -43,8 +43,8 @@ def main():
     with open(f"{prefix}.txt", "w") as f:
         f.write(f"# {len(words)} words, {inf.end} cycles, {config}\n")
         for i, w in enumerate(words):
-            rest = " ".join(f"{k}={v}" for k, v in w.items() if k not in ("length", "halt"))
-            f.write(f"{i:5d} len={w.get('length', 0):3d}{' HALT' if w.get('halt') else ''}  {rest}\n")
+            rest = " ".join(f"{k}={v}" for k, v in w.items() if k not in ("cycles", "halt"))
+            f.write(f"{i:5d} cycles={w.get('cycles', 0):3d}{' HALT' if w.get('halt') else ''}  {rest}\n")
     print(f"{len(words)} words, {inf.end} cycles -> {prefix}.json, {prefix}.txt")
 
 

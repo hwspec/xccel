@@ -23,7 +23,7 @@ class DecoderTest extends AnyFlatSpec with ChiselScalatestTester {
     c.io.start.poke(false.B)
   }
 
-  "Decoder" should "hold each word for its length, apply strides per cycle, drive slots in parallel," +
+  "Decoder" should "hold each word for its cycles, apply strides per cycle, drive slots in parallel," +
     " and self-terminate on halt" in {
       val cfg = DecoderConfig(wbCfg, abCfg, accCfg, programLength = 5, maxRunLength = 2)
 
@@ -31,7 +31,7 @@ class DecoderTest extends AnyFlatSpec with ChiselScalatestTester {
         val p = loader(c)
         // w0: WeightBuffer read, addr 0,1, while writing WeightBuffer addr
         // 3,2 and ActivationBuffer addr 4,6
-        p.word(length = 2) { w =>
+        p.word(cycles = 2) { w =>
           w.wbRead.en.poke(true.B)
           w.wbRead.addrStride.poke(1.U)
           w.wbWrite.en.poke(true.B)
@@ -54,7 +54,7 @@ class DecoderTest extends AnyFlatSpec with ChiselScalatestTester {
         }
         // w1: ActivationBuffer sweeping shiftAmt 0,1 at a fixed addr, in
         // parallel with the weight port writing slot 1, addr 0,1
-        p.word(length = 2) { w =>
+        p.word(cycles = 2) { w =>
           w.abRead.en.poke(true.B)
           w.abRead.addr.poke(5.U)
           w.abRead.shiftStride.poke(1.U)
@@ -63,7 +63,7 @@ class DecoderTest extends AnyFlatSpec with ChiselScalatestTester {
           w.weightPort.slot.poke(true.B)
         }
         // w2: one more ActivationBuffer read, compute selecting weight slot 1
-        p.word(length = 1) { w =>
+        p.word(cycles = 1) { w =>
           w.abRead.en.poke(true.B)
           w.abRead.addr.poke(5.U)
           w.abRead.shiftAmt.poke(2.U)
@@ -71,7 +71,7 @@ class DecoderTest extends AnyFlatSpec with ChiselScalatestTester {
         }
         // w3: Accumulator drain counting down (addr 3,2) with groupShift=1,
         // accumulating writes counting up (1,2)
-        p.word(length = 2) { w =>
+        p.word(cycles = 2) { w =>
           w.accRead.en.poke(true.B)
           w.accRead.addr.poke(3.U)
           w.accRead.addrStride.poke(MicroProgramLoader.minusOne(accCfg.addrWidth))
@@ -81,7 +81,7 @@ class DecoderTest extends AnyFlatSpec with ChiselScalatestTester {
           w.accWrite.accumulate.poke(true.B)
         }
         // w4: idle, halt
-        p.word(length = 1, halt = true)()
+        p.word(cycles = 1, halt = true)()
         p.done()
 
         pulseStart(c)
@@ -167,7 +167,7 @@ class DecoderTest extends AnyFlatSpec with ChiselScalatestTester {
 
     test(new Decoder(cfg)) { c =>
       val p = loader(c)
-      p.word(length = 3, halt = true) { w =>
+      p.word(cycles = 3, halt = true) { w =>
         w.wbRead.en.poke(true.B)
         w.wbRead.addr.poke(1.U)
         w.wbRead.addrStride.poke(1.U)

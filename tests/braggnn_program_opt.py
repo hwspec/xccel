@@ -35,6 +35,8 @@ accumulated into (last write + commitLatency), and its last drain read
 (a later overwrite of a reused region must come after it).
 """
 
+import heapq
+
 import numpy as np
 
 from braggnn_model import scale_to_mult_shift
@@ -126,8 +128,33 @@ class ListScheduler:
         p = self.p
         R, stream = p.rows, len(ps["ab"])
         nload = ps.get("wrows", R) if self.partial_weights else R
-        slot = 0 if self.slot_free[0] <= self.slot_free[1] else 1
         rows_pass = "loads" in ps
+        # zeroing loads depend on what earlier passes left in a slot, so with
+        # one array row per weight beat (several arrays) a slot's passes stay in
+        # placement order (the slot's high-water mark); otherwise each pass
+        # reserves its slot for the cycles its weights are live, and a pass
+        # placed later may use an earlier gap
+        ordered_slots = self.arrays > 1 and not self.wide
+        if ordered_slots:
+            return self._place_pass(ps, 0 if self.slot_free[0] <= self.slot_free[1] else 1, nload, rows_pass)
+        best = None
+        for slot in (0, 1):
+            w = self._fit_pass(ps, slot, nload, rows_pass)
+            if best is None or w < best[0]:
+                best = (w, slot)
+        return self._place_pass(ps, best[1], nload, rows_pass)
+
+    def _fit_pass(self, ps, slot, nload, rows_pass):
+        return self._pass_plan(ps, slot, nload, rows_pass)[0]
+
+    def _place_pass(self, ps, slot, nload, rows_pass):
+        w, loads, s_off, uses = self._pass_plan(ps, slot, nload, rows_pass)
+        return self._commit_pass(ps, slot, w, loads, s_off, uses)
+
+    def _pass_plan(self, ps, slot, nload, rows_pass):
+        """(earliest load start w, loads, s_off, uses) of pass ps in weight slot `slot`."""
+        p = self.p
+        R, stream = p.rows, len(ps["ab"])
         # (WeightBuffer row, weight port address, wbRead.shiftAmt): the pass's own
         # weights, then zeros for other arrays' rows its operand lanes (< wrows) would meet
         if rows_pass:
@@ -152,7 +179,13 @@ class ListScheduler:
             lag = max([0] + [j - a % R for j, (_, a, _) in enumerate(loads)])
         s_off = p.wb_read_latency + 1 - p.ab_read_latency + lag
 
-        lower = self.slot_free[slot] if self.tight_slots else self.slot_free[slot] - p.wb_read_latency
+        ordered_slots = self.arrays > 1 and not self.wide
+        lower = 0
+        if ordered_slots:
+            lower = self.slot_free[slot] if self.tight_slots else self.slot_free[slot] - p.wb_read_latency
+        # the slot holds this pass's weights from its first weight-port write to
+        # the cycle before the next pass's first write may land
+        skew = 1 if self.tree else p.cols - 1
         for j, (row, _, _) in enumerate(loads):
             lower = max(lower, self.wb_ready.get(row, 0) - j)
         for i in beats:
@@ -183,9 +216,18 @@ class ListScheduler:
                 u.append(("accWrite", c))
                 if ps["accumulate"] and row is not None:
                     u.append((self.acc_port(row), c))
+            if not ordered_slots:
+                last_arrival = A + stream - 1
+                end = last_arrival + skew if self.tight_slots else last_arrival + 1 + R + p.cols
+                u += [(f"slot{slot}", x) for x in range(w + p.wb_read_latency, end)]
             return u
 
-        w = self.fit(lower, uses)
+        return self.fit(lower, uses), loads, s_off, uses
+
+    def _commit_pass(self, ps, slot, w, loads, s_off, uses):
+        p = self.p
+        R, stream = p.rows, len(ps["ab"])
+        beats = [i for i, row in enumerate(ps["ab"]) if row is not None]
         self.claim(uses(w))
         S = w + s_off
         tb = self.table
@@ -259,8 +301,95 @@ class ListScheduler:
         return t + rl  # arrival cycle
 
 
+class OpGraph:
+    """Operations recorded in program order, then placed by list scheduling.
+
+    add() records one operation: `place` puts it into the ListScheduler (the
+    code that used to run immediately), `reads` / `writes` name the rows it
+    reads and writes (("ab", row), ("wb", row), ("acc", row)) or tokens that
+    keep a chain in order (("tok", name), listed as a write). Dependencies
+    follow from program order as in a compiler: read-after-write,
+    write-after-read (a reused Accumulator region) and write-after-write.
+    `est` is a rough duration from the operation's start until its results
+    can be used, for the priorities.
+
+    run(order): "program" places the operations in program order (the
+    original behaviour); "critical" repeatedly places, among the operations
+    whose predecessors are all placed, the one with the longest estimated
+    path to the end of the program (ties: program order); "ready" places the
+    one whose predecessors finished earliest (the last cycle their placement
+    wrote), ties by that path length -- closer to cycle-driven list
+    scheduling, where an operation is only chosen once its inputs are there.
+    Each operation still goes to its earliest feasible cycle
+    (ListScheduler.fit).
+    """
+
+    def __init__(self, sch):
+        self.sch = sch
+        self.ops = []  # (layer, place, est)
+        self.succs = []
+        self.preds = []
+        self.npreds = []
+        self.last_writer, self.readers = {}, {}
+
+    def add(self, place, reads=(), writes=(), est=1):
+        i = len(self.ops)
+        preds = set()
+        for k in reads:
+            if k in self.last_writer:
+                preds.add(self.last_writer[k])
+        for k in writes:
+            if k in self.last_writer:
+                preds.add(self.last_writer[k])
+            preds.update(self.readers.get(k, ()))
+        preds.discard(i)
+        for k in reads:
+            self.readers.setdefault(k, []).append(i)
+        for k in writes:
+            self.last_writer[k] = i
+            self.readers[k] = []
+        self.ops.append((self.sch.layer, place, est))
+        self.succs.append([])
+        self.preds.append(sorted(preds))
+        self.npreds.append(len(preds))
+        for j in preds:
+            self.succs[j].append(i)
+
+    def run(self, order="critical"):
+        n = len(self.ops)
+        prio = [0] * n
+        for i in reversed(range(n)):  # successors always come later in program order
+            prio[i] = self.ops[i][2] + max((prio[j] for j in self.succs[i]), default=0)
+        finish = [0] * n  # last table cycle an operation's placement wrote
+
+        def key(i):
+            if order == "critical":
+                return (-prio[i], i)
+            if order == "ready":
+                return (max((finish[j] for j in self.preds[i]), default=0), -prio[i], i)
+            return (i,)
+        waiting = list(self.npreds)
+        ready = [key(i) for i in range(n) if waiting[i] == 0]
+        heapq.heapify(ready)
+        placed = 0
+        table = self.sch.table
+        while ready:
+            i = heapq.heappop(ready)[-1]
+            layer, place, _ = self.ops[i]
+            self.sch.layer = layer
+            mark = len(self.sch.trace)
+            place()
+            finish[i] = max((b for _, _, _, b in self.sch.trace[mark:]), default=0)
+            placed += 1
+            for j in self.succs[i]:
+                waiting[j] -= 1
+                if waiting[j] == 0:
+                    heapq.heappush(ready, key(j))
+        assert placed == n, "dependency cycle"
+
+
 def build_opt(m, p, softmax_ops, div_latency, acc_read="shared", softmax_stats=2,
-              partial_weights=True, tile_banks=(), arrays=1, sum_ops=None, tree_latency=0):
+              partial_weights=True, tile_banks=(), arrays=1, sum_ops=None, tree_latency=0, order="best"):
     """partial_weights: load only each weight tile's valid rows and reuse a
     weight slot as soon as its last operand has left the array (10,904 ->
     10,616 cycles with two row banks and four softmax stats).
@@ -271,7 +400,18 @@ def build_opt(m, p, softmax_ops, div_latency, acc_read="shared", softmax_stats=2
     drains cost the greedy placement a few cycles (+8 .. +32).
     arrays: SystolicArrays in the compute unit (compute_arrays); with 3,
     conv2 and conv3 run one kernel row per pass (lower_conv_rows), with 9 in a
-    3 x 3 window and wide weight beats the whole kernel (lower_conv_window)."""
+    3 x 3 window and wide weight beats the whole kernel (lower_conv_window).
+    order: "program" (place operations in program order), "critical" (list
+    scheduling by critical path), "ready" (earliest-ready first), see OpGraph,
+    or "best": the shorter of "program" and "critical". The critical-path
+    priority ignores that operations on one resource serialize, so it can
+    also place an operation that only looks critical into an early gap a
+    truly critical one needed: it wins on the low-latency ReductionTree
+    configurations (-8 / -34 cycles) and loses on the others (+65 .. +452)."""
+    if order == "best":
+        args = (m, p, softmax_ops, div_latency, acc_read, softmax_stats, partial_weights, tile_banks, arrays, sum_ops,
+                tree_latency)
+        return min((build_opt(*args, order=o) for o in ("program", "critical")), key=lambda inf: inf.end)
     R, C = p.rows, p.cols
     assert R == C, "the Transposer, residual and feedback paths assume a square array"
     CH = 32  # theta / phi / g / attention . g channels
@@ -289,7 +429,9 @@ def build_opt(m, p, softmax_ops, div_latency, acc_read="shared", softmax_stats=2
                         arrays, zero_row, junk_row=half - 1,  # bank 0's last row is unused
                         kernel_cols=kernel_cols, row_pitch=pitch, wide=wide, tree_latency=tree_latency)
     tb = sch.table
+    g = OpGraph(sch)
     inf = Inference(tb, 0)
+    acc_rl, ab_rl = p.acc_read_latency, p.ab_read_latency
     if zero_row is not None:
         inf.wb_rows.append((zero_row, [0] * C))
 
@@ -324,12 +466,24 @@ def build_opt(m, p, softmax_ops, div_latency, acc_read="shared", softmax_stats=2
 
     def run_passes(passes):
         for ps in passes:
-            sch.schedule_pass(ps)
+            nload = ps.get("wrows", R) if partial_weights else R
+            wb_rows = [row for row, _ in ps["loads"]] if "loads" in ps else [ps["wb"] + r for r in range(nload)]
+            acc_rows = [("acc", r) for r in ps["acc"] if r is not None]
+            g.add(lambda ps=ps: sch.schedule_pass(ps),
+                  reads=[("ab", r) for r in ps["ab"] if r is not None] + [("wb", r) for r in wb_rows]
+                  + (acc_rows if ps["accumulate"] else []),
+                  writes=acc_rows, est=len(wb_rows) + len(ps["ab"]) + sch.latency + sch.commit + 4)
+
+    def drain(row, fields, writes_ab=None, writes_wb=None):
+        g.add(lambda: sch.schedule_drain(row, fields, writes_ab=writes_ab, writes_wb=writes_wb),
+              reads=[("acc", row)],
+              writes=[("ab", writes_ab)] if writes_ab is not None else [("wb", writes_wb)],
+              est=acc_rl + max(p.ab_write_latency, p.wb_write_latency) + 2)
 
     def drain_to_ab(acc_rows, set_of, ab_rows):
         for k, (a, b) in enumerate(zip(acc_rows, ab_rows)):
-            sch.schedule_drain(a, {"requant.paramSet": set_of(k), "abWrite.en": 1, "abWrite.addr": b,
-                                   "abWrite.fromRequantizer": 1}, writes_ab=b)
+            drain(a, {"requant.paramSet": set_of(k), "abWrite.en": 1, "abWrite.addr": b,
+                      "abWrite.fromRequantizer": 1}, writes_ab=b)
 
     def conv_layer(kind, x_shape, w, b, scale, relu, ab_in, acc_base, acc_bases=None):
         low = lower(kind, x_shape, w, b, scale, relu, ab_in, acc_base, acc_bases)
@@ -358,23 +512,31 @@ def build_opt(m, p, softmax_ops, div_latency, acc_read="shared", softmax_stats=2
     run_passes(low_phi.passes)                                                     # B1 162..323
     phi_sets = [s[0] for s in low_phi.requant]
     wb_pt = wb.take(njt * nct * R)
-    for jt in range(njt):
-        for ct in range(nct):
-            pixels = list(range(jt * C, min(N, (jt + 1) * C)))
+    def phi_t_block(jt, ct):
+        pixels = list(range(jt * C, min(N, (jt + 1) * C)))
+        cols = [wb_pt + (jt * nct + ct) * R + c for c in range(min(R, CH - ct * R))]  # the tile's channels
+
+        def place():
             last = 0
             for r, j in enumerate(pixels):
                 last = sch.schedule_drain(PHI + ct * N + j, {"requant.paramSet": phi_sets[ct], "transposer.capture": 1,
                                                              "transposer.row": r},
-                                          lower=sch.transposer_free - p.acc_read_latency, resources=("transposer",))
+                                          lower=sch.transposer_free - acc_rl, resources=("transposer",))
             t = last + 1
-            for c in range(min(R, CH - ct * R)):  # the tile's channels
+            for c, row in enumerate(cols):
                 t = sch.fit(t, lambda x: [("wbWrite", x)])
                 sch.claim([("wbWrite", t)])
-                row = wb_pt + (jt * nct + ct) * R + c
                 tb.put(t, {"wbWrite.en": 1, "wbWrite.addr": row, "wbWrite.transposed": 1, "wbWrite.column": c})
                 sch.wb_ready[row] = t + p.wb_write_latency + 1
                 t += 1
             sch.transposer_free = t  # the next block's first capture arrives after the last column read
+        g.add(place, reads=[("acc", PHI + ct * N + j) for j in pixels],
+              writes=[("wb", r) for r in cols] + [("tok", "transposer")],
+              est=len(pixels) + len(cols) + acc_rl + p.wb_write_latency + 2)
+
+    for jt in range(njt):
+        for ct in range(nct):
+            phi_t_block(jt, ct)
 
     sch.layer = "theta.phi^T"
     logit_set = add_set(m.scale["theta_phi"])
@@ -385,22 +547,20 @@ def build_opt(m, p, softmax_ops, div_latency, acc_read="shared", softmax_stats=2
 
     sch.layer = "softmax"
     ab_att = ab.take(njt * N)
-    ops = softmax_ops
+    smops = softmax_ops
     row_beats = getattr(p, "softmax_row_beats", 0)
-    rl = p.acc_read_latency
-    for row in (range(N) if row_beats else ()):
+    lanes = [min(C, N - jt * C) for jt in range(njt)]
+
+    def softmax_row_buffered(row, stat):
         # row buffer: one drain per beat (Max, kept in the buffer); the sum and
         # out stages read the buffer through their own fields, so they overlap
         # other rows' drains
-        assert row_beats >= njt
-        stat = row % softmax_stats
-        lanes = [min(C, N - jt * C) for jt in range(njt)]
         last = sch.stat_free[stat] - 1
         for jt in range(njt):
             last = sch.schedule_drain(LOG + jt * N + row, {
-                "requant.paramSet": logit_set, "softmax.op": ops["Max"], "softmax.first": int(jt == 0),
+                "requant.paramSet": logit_set, "softmax.op": smops["Max"], "softmax.first": int(jt == 0),
                 "softmax.lanes": lanes[jt], "softmax.stat": stat, "softmax.buf.store": 1, "softmax.buf.beat": jt},
-                lower=last + 1 - rl, resources=("softmax",), post=False)
+                lower=last + 1 - acc_rl, resources=("softmax",), post=False)
         t = last + 1  # the row's max and last beat are in
         for jt in range(njt + 1):  # Sum beats, then Divide
             t = sch.fit(t, lambda x: [("softmaxSum", x)])
@@ -424,31 +584,39 @@ def build_opt(m, p, softmax_ops, div_latency, acc_read="shared", softmax_stats=2
             sch.end = max(sch.end, t + 1)
             t += 1
         sch.stat_free[stat] = t
-    for row in (() if row_beats else range(N)):
-        stat = row % softmax_stats
-        lanes = [min(C, N - jt * C) for jt in range(njt)]
 
+    def softmax_row_drains(row, stat):
         def beat(op, jt, extra=None):
             return {"requant.paramSet": logit_set, "softmax.op": op, "softmax.first": int(jt == 0),
                     "softmax.lanes": lanes[jt], "softmax.stat": stat, **(extra or {})}
         # Max beats: the stat slot must be free (its previous row fully out)
         last = sch.stat_free[stat] - 1
         for jt in range(njt):
-            last = sch.schedule_drain(LOG + jt * N + row, beat(ops["Max"], jt), lower=last + 1 - p.acc_read_latency,
+            last = sch.schedule_drain(LOG + jt * N + row, beat(smops["Max"], jt), lower=last + 1 - acc_rl,
                                       resources=("softmax",))
         for jt in range(njt):  # Sum beats after every Max beat has arrived
-            last = sch.schedule_drain(LOG + jt * N + row, beat(ops["Sum"], jt), lower=last + 1 - p.acc_read_latency,
+            last = sch.schedule_drain(LOG + jt * N + row, beat(smops["Sum"], jt), lower=last + 1 - acc_rl,
                                       resources=("softmax",))
         d = sch.fit(last + 1, lambda x: [("softmax", x)])
         sch.claim([("softmax", d)])
-        tb.put(d, {"softmax.op": ops["Divide"], "softmax.stat": stat})
+        tb.put(d, {"softmax.op": smops["Divide"], "softmax.stat": stat})
         last = d + div_latency - 1
         for jt in range(njt):
             dst = ab_att + jt * N + row
-            last = sch.schedule_drain(LOG + jt * N + row, beat(ops["Out"], jt, {
+            last = sch.schedule_drain(LOG + jt * N + row, beat(smops["Out"], jt, {
                 "abWrite.en": 1, "abWrite.addr": dst, "abWrite.fromRequantizer": 1}),
-                lower=last + 1 - p.acc_read_latency, resources=("softmax",), writes_ab=dst)
+                lower=last + 1 - acc_rl, resources=("softmax",), writes_ab=dst)
         sch.stat_free[stat] = last + 1
+
+    if row_beats:
+        assert row_beats >= njt
+    for row in range(N):
+        stat = row % softmax_stats
+        place = softmax_row_buffered if row_beats else softmax_row_drains
+        g.add(lambda row=row, stat=stat, place=place: place(row, stat),
+              reads=[("acc", LOG + jt * N + row) for jt in range(njt)],
+              writes=[("ab", ab_att + jt * N + row) for jt in range(njt)] + [("tok", f"stat{stat}")],
+              est=(njt if row_beats else 3 * njt) + div_latency + 2 * njt + acc_rl + 4)
 
     sch.layer = "g -> WB"
     G = B1 + 4 * N  # B1 324..485
@@ -459,8 +627,8 @@ def build_opt(m, p, softmax_ops, div_latency, acc_read="shared", softmax_stats=2
     for cot in range(nct):
         for j in range(N):
             dst = wb_g + (cot * njt + j // R) * R + j % R
-            sch.schedule_drain(G + cot * N + j, {"requant.paramSet": g_sets[cot], "wbWrite.en": 1,
-                                                  "wbWrite.fromRequantizer": 1, "wbWrite.addr": dst}, writes_wb=dst)
+            drain(G + cot * N + j, {"requant.paramSet": g_sets[cot], "wbWrite.en": 1,
+                                    "wbWrite.fromRequantizer": 1, "wbWrite.addr": dst}, writes_wb=dst)
 
     sch.layer = "attention.g"
     ag_set = add_set(m.scale["attention_g"])
@@ -484,30 +652,37 @@ def build_opt(m, p, softmax_ops, div_latency, acc_read="shared", softmax_stats=2
     mb, sb = scale_to_mult_shift(m.scale["resadd_b"])
     inf.residual = [(0, [0] * C, [ma] * C, [sa] * C, -128, 127), (1, [0] * C, [mb] * C, [sb] * C, -128, 127)]
     RS = B1 + 2 * N  # B1 162..485 (phi / g regions, drained)
-    for ct in range(nrs):
-        for base, pset in ((ab_c1, 0), (ab_no, 1)):
-            t = 0
-            for i in range(N):
-                src, dst = base + ct * N + i, RS + ct * N + i
-                lower_t = max(t, sch.ab_ready.get(src, 0),
-                              sch.acc_read_last.get(dst, -1) + 1 - p.ab_read_latency,
-                              sch.acc_written.get(dst, -10**9) + (sch.commit if pset else 1) - p.ab_read_latency)
-                rl = p.ab_read_latency
+    def resadd_chunk(ct, base, pset):
+        pairs = [(base + ct * N + i, RS + ct * N + i) for i in range(N)]
 
-                def uses(x, dst=dst, pset=pset):
-                    u = [("abRead", x), ("accWrite", x + rl), ("residual", x + rl)]
+        def place():
+            t = 0
+            for src, dst in pairs:
+                lower_t = max(t, sch.ab_ready.get(src, 0),
+                              sch.acc_read_last.get(dst, -1) + 1 - ab_rl,
+                              sch.acc_written.get(dst, -10**9) + (sch.commit if pset else 1) - ab_rl)
+
+                def uses(x, dst=dst):
+                    u = [("abRead", x), ("accWrite", x + ab_rl), ("residual", x + ab_rl)]
                     if pset:
-                        u.append((sch.acc_port(dst), x + rl))
+                        u.append((sch.acc_port(dst), x + ab_rl))
                     return u
                 x = sch.fit(lower_t, uses)
                 sch.claim(uses(x))
                 tb.put(x, {"abRead.en": 1, "abRead.addr": src})
-                tb.put(x + rl, {"residual.en": 1, "residual.paramSet": pset, "accWrite.addr": dst,
-                                "accWrite.accumulate": pset})
-                sch.acc_written[dst] = x + rl
+                tb.put(x + ab_rl, {"residual.en": 1, "residual.paramSet": pset, "accWrite.addr": dst,
+                                   "accWrite.accumulate": pset})
+                sch.acc_written[dst] = x + ab_rl
                 sch.trace.append((sch.layer, "stream", x, x))
-                sch.end = max(sch.end, x + rl + 1)
+                sch.end = max(sch.end, x + ab_rl + 1)
                 t = x + 1
+        acc_rows = [("acc", d) for _, d in pairs]
+        g.add(place, reads=[("ab", s_) for s_, _ in pairs] + (acc_rows if pset else []), writes=acc_rows,
+              est=N + ab_rl + sch.commit + 2)
+
+    for ct in range(nrs):
+        for base, pset in ((ab_c1, 0), (ab_no, 1)):
+            resadd_chunk(ct, base, pset)
     rs_set = add_set(m.scale["resadd_c"], relu=True)
     ab_rs = ab.take(nrs * N)
     drain_to_ab([RS + k for k in range(nrs * N)], lambda k: rs_set, [ab_rs + k for k in range(nrs * N)])
@@ -539,9 +714,11 @@ def build_opt(m, p, softmax_ops, div_latency, acc_read="shared", softmax_stats=2
     OUT = B0 + 424
     low_out = lower("kn2row", (1, 1, 2), w, m.b["output"], m.scale["output"], False, ab_x, OUT)
     run_passes(low_out.passes)
+    g.run(order)
     inf.end = sch.end
     inf.output_acc_row, inf.output_set = OUT, low_out.requant[0][0]
     tb.pad(inf.end)
     inf.usage = {"wb_rows": wb.next, "ab_rows": ab.next, "requant_sets": sets.next}
+    inf.order = order
     inf.trace = sch.trace
     return inf

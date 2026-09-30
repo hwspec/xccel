@@ -1,6 +1,6 @@
-# XCCEL
+# Xccel
 
-XCCEL is a framework for exploring the SRAM design and compute unit in X-ray detector ASICs simulateniously.
+Xccel is a framework for exploring the SRAM design and compute unit in X-ray detector ASICs simulateniously.
 This framework abstracts near-sensor AI accelerators to the input activation buffer, weight buffer, accumulator, compute unit, and instraction decoder, assuming deterministic dataflow such as Groq.
 The user (whichever the human or AI agents) can specify the number of SRAMs and design of each buffer including depth, word length, the number of ports, port bandwidth, mask granularity, and read/write latency.
 Moreover, the user can replace a compute unit with their IP such as systolic array, reduction tree, and vector engine.
@@ -9,11 +9,7 @@ It does not have any caches, reservation station, and arbiters inside the accele
 ## Usage
 
 ```bash
-make -C garageworks setup
-source garageworks/.venv/bin/activate
-./mill runMain xccel.AxiXccelOpt9x64T
-cd tests
-make braggnn_inference_opt HWMODULENAME=AxiXccelOpt9x64T SIM_BUILD=sim_build_opt9x64t
+./gwscript.py
 ```
 
 ## Design Principle
@@ -39,10 +35,95 @@ This cast mode is implemented by the shifter and mux.
 - groupShift: how many grains (e.g., SRAM bank ports) correspond to ports (e.g., mesh ports)
 
 
+## Horizontal Microcode
+
+To realize deterministic dataflow architecture, Xccel adopts the horizontal microcode.
+
+| Component    | Signal          | Type (Length)                                  |
+|--------------|-----------------|------------------------------------------------|
+| wbRead       | en              | Bool                                           |
+|              | addr            | UInt(wbAddrWidth.W)                            |
+|              | addrStride      | UInt(wbAddrWidth.W)                            |
+|              | shiftAmt        | UInt(wbShiftWidth.W)                           |
+|              | shiftStride     | UInt(wbShiftWidth.W)                           |
+|              | groupShift      | UInt(wbGroupShiftWidth.W)                      |
+| wbWrite      | en              | Bool                                           |
+|              | addr            | UInt(wbAddrWidth.W)                            |
+|              | addrStride      | UInt(wbAddrWidth.W)                            |
+|              | fromRequantizer | Bool                                           |
+|              | transposed      | Bool                                           |
+|              | column          | UInt(transposerIndexWidth.W)                   |
+|              | columnStride    | UInt(transposerIndexWidth.W)                   |
+| weightPort   | en              | Bool                                           |
+|              | addr            | UInt(weightPortAddrWidth.W)                    |
+|              | addrStride      | UInt(weightPortAddrWidth.W)                    |
+|              | slot            | Bool                                           |
+| abWrite      | en              | Bool                                           |
+|              | addr            | UInt(abAddrWidth.W)                            |
+|              | addrStride      | UInt(abAddrWidth.W)                            |
+|              | fromRequantizer | Bool                                           |
+| abRead       | en              | Bool                                           |
+|              | addr            | UInt(abAddrWidth.W)                            |
+|              | addrStride      | UInt(abAddrWidth.W)                            |
+|              | shiftAmt        | UInt(abShiftWidth.W)                           |
+|              | shiftStride     | UInt(abShiftWidth.W)                           |
+|              | groupShift      | UInt(abGroupShiftWidth.W)                      |
+| compute      | weightSelect    | Bool                                           |
+| accWrite     | addr            | UInt(accAddrWidth.W)                           |
+|              | addrStride      | UInt(accAddrWidth.W)                           |
+|              | accumulate      | Bool                                           |
+| accRead      | en              | Bool                                           |
+|              | addr            | UInt(accAddrWidth.W)                           |
+|              | addrStride      | UInt(accAddrWidth.W)                           |
+|              | shiftAmt        | UInt(accShiftWidth.W)                          |
+|              | shiftStride     | UInt(accShiftWidth.W)                          |
+|              | groupShift      | UInt(accGroupShiftWidth.W)                     |
+| requant      | paramSet        | UInt(requantSetWidth.W)                        |
+| transposer   | capture         | Bool                                           |
+|              | row             | UInt(transposerIndexWidth.W)                   |
+|              | rowStride       | UInt(transposerIndexWidth.W)                   |
+| softmax      | op              | UInt(3.W) (None / Max / Sum / Divide / Out)    |
+|              | first           | Bool                                           |
+|              | lanes           | UInt(softmaxLanesWidth.W)                      |
+|              | stat            | UInt(softmaxStatWidth.W)                       |
+| softmax.buf  | store           | Bool                                           |
+| (rowBeats>0) | beat            | UInt(beatWidth.W)                              |
+|              | sumOp           | UInt(2.W) (None / Sum / Divide)                |
+|              | sumStat         | UInt(softmaxStatWidth.W)                       |
+|              | sumBeat         | UInt(beatWidth.W)                              |
+|              | sumFirst        | Bool                                           |
+|              | sumLanes        | UInt(softmaxLanesWidth.W)                      |
+|              | outEn           | Bool                                           |
+|              | outStat         | UInt(softmaxStatWidth.W)                       |
+|              | outBeat         | UInt(beatWidth.W)                              |
+|              | outLanes        | UInt(softmaxLanesWidth.W)                      |
+| residual     | en              | Bool                                           |
+|              | paramSet        | UInt(residualSetWidth.W)                       |
+| (word)       | cycles          | UInt(cyclesWidth.W)                            |
+|              | halt            | Bool                                           |
+
+| width                                | definition                                            |
+|--------------------------------------|-------------------------------------------------------|
+| wbAddrWidth                          | log2Ceil(WeightBuffer rows)                           |
+| wbShiftWidth                         | log2Ceil(words per WeightBuffer row)                  |
+| wbGroupShiftWidth                    | log2Ceil(log2Ceil(weight ports) + 1)                  |
+| abAddrWidth                          | log2Ceil(ActivationBuffer rows)                       |
+| abShiftWidth / abGroupShiftWidth     | ActivationBuffer PortAdapter (grains = rows R)        |
+| accAddrWidth                         | log2Ceil(Accumulator rows)                            |
+| accShiftWidth / accGroupShiftWidth   | Accumulator PortAdapter (grains = cols C)             |
+| weightPortAddrWidth                  | log2Ceil(compute unit weight beats)                   |
+| transposerIndexWidth                 | log2Ceil(C)                                           |
+| requantSetWidth                      | max(1, log2Ceil(Requantizer parameter sets))          |
+| softmaxLanesWidth                    | log2Ceil(C + 1)                                       |
+| softmaxStatWidth                     | max(1, log2Ceil(softmax stats))                       |
+| beatWidth                            | max(1, log2Ceil(softmax row beats))                   |
+| residualSetWidth                     | max(1, log2Ceil(residual parameter sets))             |
+| cyclesWidth                          | log2Ceil(maxRunLength + 1)                            |
+
+## Connectivity
+
+
 ## Scheduler (tentative)
-
-
-
 
 
 ## Related Works

@@ -19,31 +19,31 @@ def _stride_of(path):
 
 def compress(cycles, max_run_length, microword_layout):
     """cycles: list of {path: value} (missing fields are 0). Returns a list
-    of {path: value} MicroWords with `length` and, on the last, `halt`."""
+    of {path: value} MicroWords with `cycles` and, on the last, `halt`."""
     fields = microword_layout["fields"]
     strided = [p for p in fields if _stride_of(p) in fields]
-    words = []  # (first cycle, strides, length)
+    words = []  # (first cycle, strides, cycles)
     for c in cycles:
         if words:
-            first, strides, length = words[-1]
+            first, strides, n = words[-1]
             flags_same = all(c.get(p, 0) == first.get(p, 0)
                              for p in fields if p not in strided and not p.endswith("Stride")
-                             and p not in ("length", "halt"))
-            if length < max_run_length and flags_same:
-                if length == 1:
+                             and p not in ("cycles", "halt"))
+            if n < max_run_length and flags_same:
+                if n == 1:
                     strides = {p: c.get(p, 0) - first.get(p, 0) for p in strided}
-                if all(c.get(p, 0) == first.get(p, 0) + strides[p] * length for p in strided):
-                    words[-1] = (first, strides, length + 1)
+                if all(c.get(p, 0) == first.get(p, 0) + strides[p] * n for p in strided):
+                    words[-1] = (first, strides, n + 1)
                     continue
         words.append((c, {p: 0 for p in strided}, 1))
 
     out = []
-    for i, (first, strides, length) in enumerate(words):
+    for i, (first, strides, n) in enumerate(words):
         w = {p: v for p, v in first.items() if v}
         for p, s in strides.items():
             if s:
                 w[_stride_of(p)] = s
-        w["length"] = length
+        w["cycles"] = n
         if i == len(words) - 1:
             w["halt"] = 1
         out.append(w)

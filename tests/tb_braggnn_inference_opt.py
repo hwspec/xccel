@@ -33,7 +33,7 @@ async def tb_braggnn_inference_opt(cocotb_dut):
                     arrays=arrays, sum_ops=consts.get("softmax_sum_op"),
                     tree_latency=consts["compute_latency"] if consts.get("compute_tree") else 0)
     words = compress(inf.table.cycles, p.max_run_length, dut.layout["microword"])
-    dut.log.info(f"program ({acc_read} Accumulator read, {p.softmax_stats} softmax stats, {arrays} arrays): "
+    dut.log.info(f"program ({acc_read} Accumulator read, {p.softmax_stats} softmax stats, {arrays} arrays, {inf.order} order): "
                  f"{len(words)} words, "
                  f"{inf.end} cycles, usage {inf.usage}")
     assert len(words) <= p.program_length, f"{len(words)} words exceed the program store"
