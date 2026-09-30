@@ -74,7 +74,7 @@ class DecoderTest extends AnyFlatSpec with ChiselScalatestTester {
         p.word(length = 2) { w =>
           w.accRead.en.poke(true.B)
           w.accRead.addr.poke(3.U)
-          w.accRead.addrStride.poke(MicroProgramLoader.minusOne(accCfg.sram.addrWidth))
+          w.accRead.addrStride.poke(MicroProgramLoader.minusOne(accCfg.addrWidth))
           w.accRead.groupShift.poke(1.U)
           w.accWrite.addr.poke(1.U)
           w.accWrite.addrStride.poke(1.U)

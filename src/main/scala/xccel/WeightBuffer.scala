@@ -11,11 +11,15 @@ case class WeightBufferConfig(
   readLatency: Int,
   writeLatency: Int,
   portType: BankPortType = BankPortType.OneRW,
+  // words per weight beat handed to the compute unit (its weightBeatElems);
+  // 0 = cu.numOutputs (one array row per beat)
+  weightPorts: Int = 0,
 ) {
   require(tiles > 0, "tiles must be positive")
   require(wordsPerBank > 0, "wordsPerBank must be positive")
 
   val totalWordsPerRow: Int = numBanks * wordsPerBank
+  val numWeightPorts: Int = if (weightPorts > 0) weightPorts else cu.numOutputs
   val rowsTotal: Int = cu.numInputs * tiles
 
   val sram: SramConfig = SramConfig(
@@ -32,7 +36,7 @@ case class WeightBufferConfig(
   val adapter: PortAdapterConfig = PortAdapterConfig(
     totalGrains = totalWordsPerRow,
     grainWidth = cu.weightWidth,
-    numPorts = cu.numOutputs,
+    numPorts = numWeightPorts,
     grainsPerPort = 1,
   )
 }
@@ -48,8 +52,8 @@ class WeightBufferIO(cfg: WeightBufferConfig) extends Bundle {
   val shiftAmt = Input(UInt(cfg.adapter.shiftWidth.W))
   val groupShift = Input(UInt(cfg.adapter.groupShiftWidth.W))
 
-  // matches ComputeUnitIO.weightIn exactly
-  val weightOut = Valid(Vec(cfg.cu.numOutputs, UInt(cfg.cu.weightWidth.W)))
+  // one weight beat of the compute unit (HasStationaryWeights.weightWriteData)
+  val weightOut = Valid(Vec(cfg.numWeightPorts, UInt(cfg.cu.weightWidth.W)))
 }
 
 class WeightBuffer(cfg: WeightBufferConfig) extends Module {

@@ -34,7 +34,10 @@ class SystolicArray(cfg: ComputeUnitConfig) extends ComputeUnit(cfg) with HasSta
       val psumHere = if (r == 0) 0.S(cfg.outputWidth.W) else psumRegs(r - 1)(c)
       actRegs(r)(c) := actHere
       selRegs(r)(c) := selHere
-      psumRegs(r)(c) := psumHere + (actHere.asSInt * weightRegs(selHere.asUInt)(r)(c).asSInt)
+      // slot as a 2:1 mux on static indices (a dynamic index would copy the
+      // whole weight type per PE during elaboration)
+      val weight = Mux(selHere, weightRegs(1)(r)(c), weightRegs(0)(r)(c))
+      psumRegs(r)(c) := psumHere + (actHere.asSInt * weight.asSInt)
     }
   }
 

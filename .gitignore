@@ -3,3 +3,9 @@ out/
 .metals/
 .bsp/
 build/
+__pycache__/
+.vcd
+.xml
+.log
+generated/
+test/sim_build*

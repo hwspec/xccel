@@ -15,10 +15,31 @@ case class XccelConfig(
   requantParamSets: Int = 1,
   softmaxStats: Int = 1,
   residualParamSets: Int = 2,
+  // arrays in the compute unit: 1 = SystolicArray (or ReductionTree), n > 1 =
+  // SystolicArrayN (or ReductionTreeN), a (n / computeKernelCols) x computeKernelCols window of
+  // kernel positions per pass over input rows of computeRowPitch beats, with
+  // one array row per weight beat or (computeWideWeights) row r of every array
+  computeArrays: Int = 1,
+  computeKernelCols: Int = 0, // 0 = computeArrays (one kernel row)
+  computeRowPitch: Int = 0,
+  computeWideWeights: Boolean = false,
+  softmaxRowBeats: Int = 0, // Softmax row buffer (beats per row; 0: three drains per row)
+  computeTree: Boolean = false, // ReductionTree(N) instead of SystolicArray(N)
 ) {
   require(weightBuffer.cu == cu, "weightBuffer must share this Xccel's ComputeUnitConfig")
   require(activationBuffer.cu == cu, "activationBuffer must share this Xccel's ComputeUnitConfig")
   require(accumulator.cu == cu, "accumulator must share this Xccel's ComputeUnitConfig")
+
+  val kernelCols: Int = if (computeKernelCols > 0) computeKernelCols else computeArrays
+  val wideWeights: Boolean = computeArrays > 1 && computeWideWeights
+  // operand presented -> its result on resultOut
+  val computeLatency: Int =
+    if (computeTree) ReductionTree.latency(cu.numInputs) else cu.numInputs + cu.numOutputs - 1
+  // the compute unit's weight beats: how many, and how many words each
+  val weightBeats: Int = if (computeArrays == 1 || wideWeights) cu.numInputs else computeArrays * cu.numInputs
+  val weightBeatElems: Int = if (wideWeights) computeArrays * cu.numOutputs else cu.numOutputs
+  require(weightBuffer.numWeightPorts == weightBeatElems,
+    s"weightBuffer.weightPorts must be the compute unit's weight beat ($weightBeatElems words)")
 
   val requantizer: RequantizerConfig =
     RequantizerConfig(cu.numOutputs, cu.outputWidth, requantizedWidth, requantMultWidth, requantParamSets)
@@ -35,7 +56,7 @@ case class XccelConfig(
   // of condition. Otherwise wbWrite.fromRequantizer/transposed have no effect.
   val weightFeedback: Boolean =
     requantizedWidth == cu.weightWidth && cu.numOutputs <= weightBuffer.totalWordsPerRow
-  val softmax: SoftmaxConfig = SoftmaxConfig(cu.numOutputs, requantizedWidth, softmaxStats)
+  val softmax: SoftmaxConfig = SoftmaxConfig(cu.numOutputs, requantizedWidth, softmaxStats, rowBeats = softmaxRowBeats)
 
   // Residual-add path: an ActivationBuffer beat goes through a scaler (a
   // Requantizer, int8 in and out: round(a * scale) saturated to int8) into
@@ -47,7 +68,7 @@ case class XccelConfig(
     RequantizerConfig(cu.numInputs, cu.inputWidth, cu.inputWidth, requantMultWidth, residualParamSets)
   val decoder: DecoderConfig = DecoderConfig(
     weightBuffer, activationBuffer, accumulator, programLength, maxRunLength, requantParamSets, softmaxStats,
-    residualParamSets)
+    residualParamSets, weightBeats, softmaxRowBeats)
 }
 
 class XccelIO(cfg: XccelConfig) extends Bundle {
@@ -73,7 +94,7 @@ class XccelIO(cfg: XccelConfig) extends Bundle {
 
   // host drain of Accumulator -- same rule, yields to the program's
   // accRead slot whenever that slot is enabled
-  val accReadAddr = Input(UInt(cfg.accumulator.sram.addrWidth.W))
+  val accReadAddr = Input(UInt(cfg.accumulator.addrWidth.W))
   val accReadEn = Input(Bool())
   // Requantizer parameter set for host drains (while running, the
   // program's requant slot selects it)
@@ -107,7 +128,13 @@ class Xccel(cfg: XccelConfig) extends Module {
 
   private val weightBuffer = Module(new WeightBuffer(cfg.weightBuffer))
   private val activationBuffer = Module(new ActivationBuffer(cfg.activationBuffer))
-  private val compute = Module(new SystolicArray(cfg.cu))
+  private val compute: ComputeUnit with HasStationaryWeights =
+    if (cfg.computeArrays > 1 && cfg.computeTree)
+      Module(new ReductionTreeN(cfg.cu, cfg.computeArrays, cfg.kernelCols, cfg.computeRowPitch, cfg.wideWeights))
+    else if (cfg.computeArrays > 1)
+      Module(new SystolicArrayN(cfg.cu, cfg.computeArrays, cfg.kernelCols, cfg.computeRowPitch, cfg.wideWeights))
+    else if (cfg.computeTree) Module(new ReductionTree(cfg.cu))
+    else Module(new SystolicArray(cfg.cu))
   private val accumulator = Module(new Accumulator(cfg.accumulator))
   private val requantizer = Module(new Requantizer(cfg.requantizer))
   // Softmax sits on the Requantizer output and passes it through unless the
@@ -119,6 +146,7 @@ class Xccel(cfg: XccelConfig) extends Module {
   softmax.io.ctrl.first := decoder.io.softmax.first
   softmax.io.ctrl.lanes := decoder.io.softmax.lanes
   softmax.io.ctrl.stat := decoder.io.softmax.stat
+  for (b <- softmax.io.ctrl.buf; d <- decoder.io.softmax.buf) b := d
   softmax.io.paramWriteEn := io.softmaxParamWriteEn
   softmax.io.paramWriteData := io.softmaxParamWriteData
   private val post = softmax.io.out

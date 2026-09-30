@@ -147,6 +147,23 @@ class SramTest extends AnyFlatSpec with ChiselScalatestTester {
     }
   }
 
+  it should "assert when a read is requested in the cycle a delayed write (writeLatency > 1) reaches the channel" in {
+    val cfg = SramConfig(depth = 8, wordLength = 8, numBanks = 1, bankBandwidth = 8, maskGranularity = 8,
+      readLatency = 1, writeLatency = 2)
+    intercept[chisel3.simulator.Exceptions.AssertionFailed] {
+      test(new Sram(cfg)) { c =>
+        val b = c.io.banks(0)
+        b.wmask.poke(allOnesMask(cfg))
+        // cycle 0: write row 1 (reaches the bank at cycle 1)
+        b.addr.poke(1.U); b.en.poke(true.B); b.wen.poke(true.B); b.wdata.poke(5.U)
+        c.clock.step()
+        // cycle 1: read row 2 while that write takes the channel
+        b.addr.poke(2.U); b.wen.poke(false.B)
+        c.clock.step()
+      }
+    }
+  }
+
   "Sram (OneR1W)" should "read one address while simultaneously writing a different one" in {
     val cfg = SramConfig(
       depth = 8,

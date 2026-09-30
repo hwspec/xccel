@@ -20,13 +20,7 @@ class PortAdapterProbe(cfg: PortAdapterConfig) extends Module {
 
 class PortAdapterTest extends AnyFlatSpec with ChiselScalatestTester {
 
-  "PortAdapterConfig" should "reject a numPorts that isn't a power of two" in {
-    intercept[IllegalArgumentException] {
-      PortAdapterConfig(totalGrains = 6, grainWidth = 8, numPorts = 3, grainsPerPort = 1)
-    }
-  }
-
-  it should "reject totalGrains smaller than numPorts*grainsPerPort" in {
+  "PortAdapterConfig" should "reject totalGrains smaller than numPorts*grainsPerPort" in {
     intercept[IllegalArgumentException] {
       PortAdapterConfig(totalGrains = 3, grainWidth = 8, numPorts = 4, grainsPerPort = 1)
     }
@@ -100,6 +94,24 @@ class PortAdapterTest extends AnyFlatSpec with ChiselScalatestTester {
       // as Sram.fromChunks / the buffers' own wdata packing)
       c.io.ports(0).expect("b0010_0001".U) // Cat(grain1=2, grain0=1)
       c.io.ports(1).expect("b0100_0011".U) // Cat(grain3=4, grain2=3)
+    }
+  }
+
+  "PortAdapter" should "rotate, unicast and broadcast with a numPorts that is not a power of two (a wide weight beat)" in {
+    val cfg = PortAdapterConfig(totalGrains = 6, grainWidth = 8, numPorts = 6, grainsPerPort = 1)
+    test(new PortAdapterProbe(cfg)) { c =>
+      for (i <- 0 until 6) c.io.grains(i).poke((10 + i).U)
+      // unicast, rotated by 2: port j gets grain (j + 2) mod 6
+      c.io.shiftAmt.poke(2.U)
+      c.io.groupShift.poke(0.U)
+      for (j <- 0 until 6) c.io.ports(j).expect((10 + (j + 2) % 6).U)
+      // groups of 4 ports: the last group (ports 4, 5) is partial
+      c.io.shiftAmt.poke(0.U)
+      c.io.groupShift.poke(2.U)
+      for (j <- 0 until 6) c.io.ports(j).expect((10 + j / 4).U)
+      // groupShift = log2Ceil(6) = 3: broadcast
+      c.io.groupShift.poke(3.U)
+      for (j <- 0 until 6) c.io.ports(j).expect(10.U)
     }
   }
 }

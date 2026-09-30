@@ -70,12 +70,14 @@ class ResidualSlot(setWidth: Int) extends Bundle {
 }
 
 // Softmax: what the Softmax unit does with the Requantizer beat of this
-// cycle (SoftmaxOp: None passes it through), for which row in flight.
-class SoftmaxSlot(lanesWidth: Int, statWidth: Int) extends Bundle {
+// cycle (SoftmaxOp: None passes it through), for which row in flight, and
+// with a row buffer (rowBeats > 0) what its sum and out stages do.
+class SoftmaxSlot(lanesWidth: Int, statWidth: Int, rowBeats: Int) extends Bundle {
   val op = UInt(SoftmaxOp.width.W)
   val first = Bool()
   val lanes = UInt(lanesWidth.W)
   val stat = UInt(statWidth.W)
+  val buf = if (rowBeats > 0) Some(new SoftmaxBufCtrl(lanesWidth, statWidth, math.max(1, log2Ceil(math.max(rowBeats, 1))))) else None
 }
 
 // Transposer: capture the Requantizer output of this cycle into row `row`.
@@ -127,15 +129,15 @@ class MicroWord(cfg: DecoderConfig) extends Bundle {
     cfg.activationBuffer.adapter.groupShiftWidth,
   )
   val compute = new ComputeSlot
-  val accWrite = new AccWriteSlot(cfg.accumulator.sram.addrWidth)
+  val accWrite = new AccWriteSlot(cfg.accumulator.addrWidth)
   val accRead = new ReadSlot(
-    cfg.accumulator.sram.addrWidth,
+    cfg.accumulator.addrWidth,
     cfg.accumulator.adapter.shiftWidth,
     cfg.accumulator.adapter.groupShiftWidth,
   )
   val requant = new RequantSlot(cfg.requantSetWidth)
   val transposer = new TransposerSlot(cfg.transposerIndexWidth)
-  val softmax = new SoftmaxSlot(cfg.softmaxLanesWidth, cfg.softmaxStatWidth)
+  val softmax = new SoftmaxSlot(cfg.softmaxLanesWidth, cfg.softmaxStatWidth, cfg.softmaxRowBeats)
   val residual = new ResidualSlot(cfg.residualSetWidth)
   val length = UInt(cfg.lengthWidth.W) // cycles this word is held, must be >= 1
   val halt = Bool() // stop after this word's last cycle
@@ -194,6 +196,9 @@ case class DecoderConfig(
   requantParamSets: Int = 1,
   softmaxStats: Int = 1,
   residualParamSets: Int = 2,
+  // weight beats the compute unit addresses (HasStationaryWeights.weightTotalBeats)
+  weightPortBeats: Int = 0, // 0 = numInputs (SystolicArray)
+  softmaxRowBeats: Int = 0, // Softmax row buffer beats (0: none)
 ) {
   require(programLength > 0, "programLength must be positive")
   require(maxRunLength > 0, "maxRunLength must be positive")
@@ -202,9 +207,9 @@ case class DecoderConfig(
     "all three buffers must share the same ComputeUnitConfig"
   )
 
-  // matches HasStationaryWeights' weightWriteAddr for a compute unit whose
-  // weightTotalBeats is numInputs (SystolicArray)
-  val weightPortAddrWidth: Int = math.max(1, log2Ceil(weightBuffer.cu.numInputs))
+  // matches HasStationaryWeights' weightWriteAddr
+  val weightPortAddrWidth: Int =
+    math.max(1, log2Ceil(if (weightPortBeats > 0) weightPortBeats else weightBuffer.cu.numInputs))
   val lengthWidth: Int = log2Ceil(maxRunLength + 1)
   val requantSetWidth: Int = math.max(1, log2Ceil(requantParamSets))
   // Transposer is numOutputs x numOutputs (one Requantizer beat per row)
@@ -241,11 +246,11 @@ class DecoderIO(cfg: DecoderConfig) extends Bundle {
   val weightSelect = Output(Bool())
   val requantParamSet = Output(UInt(cfg.requantSetWidth.W))
   val transposer = Output(new TransposerCtrl(cfg.transposerIndexWidth))
-  val softmax = Output(new SoftmaxSlot(cfg.softmaxLanesWidth, cfg.softmaxStatWidth))
+  val softmax = Output(new SoftmaxSlot(cfg.softmaxLanesWidth, cfg.softmaxStatWidth, cfg.softmaxRowBeats))
   val residual = Output(new ResidualSlot(cfg.residualSetWidth))
-  val accWrite = Output(new AccWriteCtrl(cfg.accumulator.sram.addrWidth))
+  val accWrite = Output(new AccWriteCtrl(cfg.accumulator.addrWidth))
   val accRead = Output(new ReadCtrl(
-    cfg.accumulator.sram.addrWidth,
+    cfg.accumulator.addrWidth,
     cfg.accumulator.adapter.shiftWidth,
     cfg.accumulator.adapter.groupShiftWidth,
   ))
@@ -254,17 +259,23 @@ class DecoderIO(cfg: DecoderConfig) extends Bundle {
 class Decoder(cfg: DecoderConfig) extends Module {
   val io = IO(new DecoderIO(cfg))
 
-  private val prog = Reg(Vec(cfg.programLength, new MicroWord(cfg)))
+  // Program store: an SRAM (SyncReadMem, one-cycle read). The word for the
+  // next cycle is read one cycle ahead (nextIdx), so `word` is always the
+  // current one and the timing seen outside is that of a combinational
+  // store. The host must not write the program while running.
+  private val prog = SyncReadMem(cfg.programLength, new MicroWord(cfg))
   when(io.progWriteEn) {
-    prog(io.progWriteAddr) := io.progWriteData
+    prog.write(io.progWriteAddr, io.progWriteData)
   }
 
   private val running = RegInit(false.B)
   private val wordIdx = RegInit(0.U(cfg.wordIdxWidth.W))
   private val step = RegInit(0.U(cfg.lengthWidth.W))
 
-  private val word = prog(wordIdx)
+  private val nextIdx = Wire(UInt(cfg.wordIdxWidth.W))
+  private val word = prog.read(nextIdx)
   private val atLastStep = step === (word.length - 1.U)
+  nextIdx := Mux(io.start, 0.U, Mux(running && atLastStep, wordIdx + 1.U, wordIdx))
 
   when(io.start) {
     running := true.B
@@ -315,6 +326,11 @@ class Decoder(cfg: DecoderConfig) extends Module {
   io.residual.paramSet := word.residual.paramSet
   io.softmax := word.softmax
   io.softmax.op := Mux(running, word.softmax.op, SoftmaxOp.None.U)
+  for (b <- io.softmax.buf; w <- word.softmax.buf) {
+    b.store := running && w.store
+    b.sumOp := Mux(running, w.sumOp, SoftmaxSumOp.None.U)
+    b.outEn := running && w.outEn
+  }
   io.transposer.capture := running && word.transposer.capture
   io.transposer.row := strided(word.transposer.row, word.transposer.rowStride)
   resolveWrite(word.abWrite, io.abWrite)

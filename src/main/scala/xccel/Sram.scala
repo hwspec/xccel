@@ -80,7 +80,10 @@ object Sram {
   // Drives one read stream and one write stream onto an Sram's channels,
   // for any port type, and returns each bank's rdata. `wdata(n)` is bank
   // n's packed row. OneRW: both share the bank's single channel; a read
-  // takes it, so a write in the same cycle is dropped. OneR1W: each stream
+  // takes it, so a write in the same cycle is dropped, and with writeLatency
+  // > 1 an accepted write takes the channel writeLatency - 1 cycles later,
+  // when a read requested in that cycle returns undefined data (the caller
+  // must keep both collisions apart). OneR1W: each stream
   // gets its own channel. TwoRW: channel 0 reads, channel 1 writes (its
   // ability to do two reads per cycle is not used here).
   def connectReadWrite(
@@ -148,6 +151,11 @@ class Sram(cfg: SramConfig) extends Module {
     val bankEn = readReq || wEnPipe
     val bankAddr = Mux(bankIsWrite, wAddrPipe, b.addr)
 
+    // a write accepted writeLatency - 1 cycles ago takes the channel now, so
+    // a read requested in this cycle would return undefined data (never with
+    // writeLatency = 1: then the write and the read are the same request)
+    assert(!(readReq && wEnPipe),
+      "Sram: read requested in the cycle a delayed write reaches the same channel (writeLatency > 1)")
     val raw = mem.readWrite(bankAddr, toChunks(wDataPipe), wMaskPipe.asBools, bankEn, bankIsWrite)
     b.rdata := ShiftRegister(fromChunks(raw), cfg.readLatency - 1, 0.U(cfg.bankBandwidth.W), true.B)
   }

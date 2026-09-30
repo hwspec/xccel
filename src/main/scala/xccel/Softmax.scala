@@ -29,7 +29,22 @@ import chisel3.util._
 // integer K / sum, so results can differ from the float reference in the
 // last bit.
 //
-// Combinational except for the per-stat registers and dividers.
+// Row buffer (rowBeats > 0): the unit keeps up to rowBeats beats of each
+// stat's row, so a row is drained from Accumulator once. Three stages, each
+// with its own control, can then work on different rows in the same cycle:
+//
+//   input  op = Max with buf.store: max as above, and the beat is kept in
+//          buffer[stat][buf.beat]
+//   sum    buf.sumOp = Sum: sum[sumStat] += iexp over buffer[sumStat][sumBeat]
+//          (sumFirst starts the row); Divide starts sumStat's divider
+//   out    buf.outEn: the output is the normalized buffer[outStat][outBeat]
+//          (instead of `in`), on outLanes lanes
+//
+// A stat's buffer and registers belong to one row until its last Out; the
+// program keeps the stages in order per row (Sum after the row's last Max,
+// Out from Divide + divLatency).
+//
+// Combinational except for the per-stat registers, buffers and dividers.
 object SoftmaxOp {
   val width: Int = 3
   val None: Int = 0
@@ -39,14 +54,24 @@ object SoftmaxOp {
   val Out: Int = 4
 }
 
-case class SoftmaxConfig(numLanes: Int, inWidth: Int, numStats: Int = 1, kWidth: Int = 32) {
+// the row-buffer sum stage's op
+object SoftmaxSumOp {
+  val width: Int = 2
+  val None: Int = 0
+  val Sum: Int = 1
+  val Divide: Int = 2
+}
+
+case class SoftmaxConfig(numLanes: Int, inWidth: Int, numStats: Int = 1, kWidth: Int = 32, rowBeats: Int = 0) {
   require(numLanes > 0, "numLanes must be positive")
   require(inWidth > 0, "inWidth must be positive")
   require(numStats > 0, "numStats must be positive")
   require(kWidth > 0 && kWidth <= 32, "kWidth must be in 1..32")
 
+  require(rowBeats >= 0, "rowBeats must be non-negative")
   val statWidth: Int = math.max(1, log2Ceil(numStats))
   val lanesWidth: Int = log2Ceil(numLanes + 1)
+  val beatWidth: Int = math.max(1, log2Ceil(math.max(rowBeats, 1)))
   val shiftWidth: Int = 6
   // a Divide op at cycle t lets Out ops use the reciprocal from t + divLatency on
   val divLatency: Int = kWidth + 1
@@ -69,6 +94,22 @@ class SoftmaxCtrl(cfg: SoftmaxConfig) extends Bundle {
   val first = Bool()
   val lanes = UInt(cfg.lanesWidth.W)
   val stat = UInt(cfg.statWidth.W)
+  val buf = if (cfg.rowBeats > 0) Some(new SoftmaxBufCtrl(cfg.lanesWidth, cfg.statWidth, cfg.beatWidth)) else None
+}
+
+// row-buffer stages (rowBeats > 0), see Softmax
+class SoftmaxBufCtrl(lanesWidth: Int, statWidth: Int, beatWidth: Int) extends Bundle {
+  val store = Bool()
+  val beat = UInt(beatWidth.W)
+  val sumOp = UInt(SoftmaxSumOp.width.W)
+  val sumStat = UInt(statWidth.W)
+  val sumBeat = UInt(beatWidth.W)
+  val sumFirst = Bool()
+  val sumLanes = UInt(lanesWidth.W)
+  val outEn = Bool()
+  val outStat = UInt(statWidth.W)
+  val outBeat = UInt(beatWidth.W)
+  val outLanes = UInt(lanesWidth.W)
 }
 
 class SoftmaxIO(cfg: SoftmaxConfig) extends Bundle {
@@ -97,11 +138,12 @@ class Softmax(cfg: SoftmaxConfig) extends Module {
 
   private val ctrl = io.ctrl
   private val x = io.in.bits.map(_.asSInt)
-  private val valid = Seq.tabulate(cfg.numLanes)(i => i.U < ctrl.lanes)
+  private def laneMask(lanes: UInt): Seq[Bool] = Seq.tabulate(cfg.numLanes)(i => i.U < lanes)
+  private val valid = laneMask(ctrl.lanes)
   private val rowMax = maxReg(ctrl.stat)
 
-  private def iexp(v: SInt): SInt = {
-    val neg = i32(rowMax -& v)
+  private def iexp(v: SInt, max: SInt): SInt = {
+    val neg = i32(max -& v)
     val z = i32((neg * params.qln2Inv) >> 16)
     val qp = i32(i32(z * params.qln2) - neg)
     val qpb = i32(qp + params.qb)
@@ -109,11 +151,13 @@ class Softmax(cfg: SoftmaxConfig) extends Module {
     val shift = Mux(z > params.maxShift.zext, params.maxShift, z.asUInt(cfg.shiftWidth - 1, 0))
     q >> shift
   }
+  private def maskedSum(exps: Seq[SInt], ok: Seq[Bool]): SInt =
+    exps.zip(ok).map { case (e, v) => Mux(v, e, 0.S) }.reduce((a, b) => i32(a + b))
 
   private val minIn = cfg.outMin.S(cfg.inWidth.W)
   private val beatMax = x.zip(valid).map { case (v, ok) => Mux(ok, v, minIn) }.reduce((a, b) => Mux(a > b, a, b))
-  private val exps = x.map(iexp)
-  private val beatSum = exps.zip(valid).map { case (e, ok) => Mux(ok, e, 0.S) }.reduce((a, b) => i32(a + b))
+  private val exps = x.map(iexp(_, rowMax))
+  private val beatSum = maskedSum(exps, valid)
 
   when(ctrl.op === SoftmaxOp.Max.U) {
     maxReg(ctrl.stat) := Mux(ctrl.first || beatMax > rowMax, beatMax, rowMax)
@@ -122,6 +166,23 @@ class Softmax(cfg: SoftmaxConfig) extends Module {
     sumReg(ctrl.stat) := Mux(ctrl.first, beatSum, i32(sumReg(ctrl.stat) + beatSum))
   }
 
+  // row buffer: input stage stores, sum stage accumulates from it
+  private val buf = ctrl.buf
+  private val rowBuffer = buf.map(_ => Reg(Vec(cfg.numStats, Vec(cfg.rowBeats, Vec(cfg.numLanes, UInt(cfg.inWidth.W))))))
+  for (b <- buf; rb <- rowBuffer) {
+    when(ctrl.op === SoftmaxOp.Max.U && b.store) {
+      rb(ctrl.stat)(b.beat) := io.in.bits
+    }
+    val sumExps = rb(b.sumStat)(b.sumBeat).map(v => iexp(v.asSInt, maxReg(b.sumStat)))
+    val sumBeat = maskedSum(sumExps, laneMask(b.sumLanes))
+    when(b.sumOp === SoftmaxSumOp.Sum.U) {
+      sumReg(b.sumStat) := Mux(b.sumFirst, sumBeat, i32(sumReg(b.sumStat) + sumBeat))
+    }
+  }
+  private def divideStarts(s: Int): Bool =
+    (ctrl.op === SoftmaxOp.Divide.U && ctrl.stat === s.U) ||
+      buf.map(b => b.sumOp === SoftmaxSumOp.Divide.U && b.sumStat === s.U).getOrElse(false.B)
+
   // one restoring divider per stat: recip = K / sum, one quotient bit per cycle
   private val recip = Seq.tabulate(cfg.numStats) { s =>
     val remainder = Reg(UInt((cfg.kWidth + 1).W))
@@ -129,7 +190,7 @@ class Softmax(cfg: SoftmaxConfig) extends Module {
     val dividend = Reg(UInt(cfg.kWidth.W))
     val divisor = Reg(UInt(32.W))
     val left = RegInit(0.U(log2Ceil(cfg.kWidth + 1).W))
-    when(ctrl.op === SoftmaxOp.Divide.U && ctrl.stat === s.U) {
+    when(divideStarts(s)) {
       remainder := 0.U
       quotient := 0.U
       dividend := params.k
@@ -145,16 +206,23 @@ class Softmax(cfg: SoftmaxConfig) extends Module {
     }
     quotient
   }
-  private val rowRecip = VecInit(recip)(ctrl.stat)
 
-  private val normalized = VecInit(exps.zip(valid).map { case (e, ok) =>
-    val product = e * rowRecip.zext
+  private def normalize(exps: Seq[SInt], ok: Seq[Bool], r: UInt): Vec[UInt] = VecInit(exps.zip(ok).map { case (e, v) =>
+    val product = e * r.zext
     val half = (1.S(2.W) << (params.outShift - 1.U)).asSInt
     val rounded = Mux(params.outShift === 0.U, product, (product + half) >> params.outShift) // product >= 0
     val clamped = Mux(rounded > cfg.outMax.S, cfg.outMax.S, Mux(rounded < cfg.outMin.S, cfg.outMin.S, rounded))
-    Mux(ok, clamped.asUInt(cfg.inWidth - 1, 0), 0.U(cfg.inWidth.W))
+    Mux(v, clamped.asUInt(cfg.inWidth - 1, 0), 0.U(cfg.inWidth.W))
   })
 
-  io.out.bits := Mux(ctrl.op === SoftmaxOp.Out.U, normalized, io.in.bits)
-  io.out.valid := io.in.valid
+  private val normalized = normalize(exps, valid, VecInit(recip)(ctrl.stat))
+  private val passOrOut = Mux(ctrl.op === SoftmaxOp.Out.U, normalized, io.in.bits)
+
+  // out stage: the normalized buffered beat replaces `in` on the output
+  private val bufOut = for (b <- buf; rb <- rowBuffer) yield {
+    val outExps = rb(b.outStat)(b.outBeat).map(v => iexp(v.asSInt, maxReg(b.outStat)))
+    (b.outEn, normalize(outExps, laneMask(b.outLanes), VecInit(recip)(b.outStat)))
+  }
+  io.out.bits := bufOut.map { case (en, v) => Mux(en, v, passOrOut) }.getOrElse(passOrOut)
+  io.out.valid := io.in.valid || bufOut.map(_._1).getOrElse(false.B)
 }

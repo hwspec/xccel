@@ -20,11 +20,9 @@ case class PortAdapterConfig(totalGrains: Int, grainWidth: Int, numPorts: Int, g
   require(grainWidth > 0, "grainWidth must be positive")
   require(numPorts > 0, "numPorts must be positive")
   require(grainsPerPort > 0, "grainsPerPort must be positive")
-  require(
-    (numPorts & (numPorts - 1)) == 0,
-    s"numPorts ($numPorts) must be a power of two so groupShift can address every group size" +
-      " (unicast..broadcast) with a plain shift, not a divider"
-  )
+  // groups are 2^groupShift consecutive ports (a plain shift, not a
+  // divider); with a numPorts that is not a power of two the last group is
+  // partial, and groupShift = log2Ceil(numPorts) is still broadcast
   require(
     totalGrains >= numPorts * grainsPerPort,
     s"totalGrains ($totalGrains) must cover unicast mode's worst case," +
@@ -40,20 +38,17 @@ case class PortAdapterConfig(totalGrains: Int, grainWidth: Int, numPorts: Int, g
 object PortAdapter {
   def connect(cfg: PortAdapterConfig, grains: Vec[UInt], shiftAmt: UInt, groupShift: UInt): Vec[UInt] = {
     val rotated = BarrelShifter.rotateLeft(grains, shiftAmt)
-    // pin the index width explicitly rather than let it drift through the
-    // shift/multiply chain -- must cover indices up to numPorts*grainsPerPort-1
-    val idxWidth = math.max(1, log2Ceil(cfg.numPorts * cfg.grainsPerPort))
+    // port j takes group j >> groupShift. groupShift only ranges over
+    // 0..log2Ceil(numPorts) (any larger value is broadcast, like the last), so
+    // each port selects among those few static groups instead of indexing the
+    // whole grain pool (numPorts x log numPorts muxes, not numPorts x grains)
+    val maxShift = log2Ceil(cfg.numPorts)
     VecInit((0 until cfg.numPorts).map { j =>
-      val group = Wire(UInt(idxWidth.W))
-      group := j.U >> groupShift
-      val base = Wire(UInt(idxWidth.W))
-      base := group * cfg.grainsPerPort.U
-      val slices = (0 until cfg.grainsPerPort).reverse.map { i =>
-        val idx = Wire(UInt(idxWidth.W))
-        idx := base + i.U
-        rotated(idx)
+      def port(g: Int): UInt = {
+        val base = (j >> g) * cfg.grainsPerPort
+        Cat((0 until cfg.grainsPerPort).reverse.map(i => rotated(base + i)))
       }
-      Cat(slices)
+      MuxLookup(groupShift, port(maxShift))((0 until maxShift).map(g => g.U -> port(g)))
     })
   }
 }

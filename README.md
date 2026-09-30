@@ -6,6 +6,11 @@ The user (whichever the human or AI agents) can specify the number of SRAMs and 
 Moreover, the user can replace a compute unit with their IP such as systolic array, reduction tree, and vector engine.
 It does not have any caches, reservation station, and arbiters inside the accelerator since it adopts deterministic dataflow architecture.
 
+## Setup
+
+```bash
+make -C chisel-axi-utils setup
+```
 
 ## Design Principle
 
@@ -28,6 +33,12 @@ This cast mode is implemented by the shifter and mux.
 
 - shiftAmt: implemented by a barrel shifter between components (e.g., interface of SRAM and systolic array mesh)
 - groupShift: how many grains (e.g., SRAM bank ports) correspond to ports (e.g., mesh ports)
+
+
+## Scheduler (tentative)
+
+
+
 
 
 ## Related Works

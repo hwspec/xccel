@@ -117,6 +117,69 @@ class SoftmaxTest extends AnyFlatSpec with ChiselScalatestTester {
     }
   }
 
+  it should "drain each row once with a row buffer, its input, sum and out stages working on different rows in the same cycles" in {
+    val cfg = SoftmaxConfig(numLanes = 4, inWidth = 8, numStats = 2, rowBeats = 2)
+    val c = SoftmaxRef.braggnn
+    val rnd = new scala.util.Random(7)
+    val rows = Seq.fill(3, 6)(rnd.nextInt(256) - 128) // beats of 4 + 2 valid lanes
+    val expected = rows.map(SoftmaxRef.row(c, _))
+    def beats(r: Int) = rows(r).grouped(cfg.numLanes).toSeq
+
+    test(new Softmax(cfg)) { dut =>
+      dut.io.paramWriteEn.poke(true.B)
+      SoftmaxRef.poke(dut.io.paramWriteData, c)
+      dut.clock.step()
+      dut.io.paramWriteEn.poke(false.B)
+      val b = dut.io.ctrl.buf.get
+
+      // per cycle: (input row, beat), (sum row, beat or Divide), (out row, beat); row r uses stat r % 2
+      case class Cycle(in: Option[(Int, Int)] = None, sum: Option[(Int, Int)] = None, div: Option[Int] = None,
+                       out: Option[(Int, Int)] = None)
+      val d = cfg.divLatency
+      // row 0: in 0-1, sum 2-3, divide 4, out 4+d..; row 1: in 2-3 (with row 0's sum), sum 5-6, divide 7;
+      // row 2 reuses stat 0 after row 0's last out
+      val plan = scala.collection.mutable.Map.empty[Int, Cycle].withDefaultValue(Cycle())
+      def at(t: Int)(f: Cycle => Cycle): Unit = plan(t) = f(plan(t))
+      at(0)(_.copy(in = Some((0, 0)))); at(1)(_.copy(in = Some((0, 1))))
+      at(2)(_.copy(in = Some((1, 0)), sum = Some((0, 0)))); at(3)(_.copy(in = Some((1, 1)), sum = Some((0, 1))))
+      at(4)(_.copy(div = Some(0)))
+      at(5)(_.copy(sum = Some((1, 0)))); at(6)(_.copy(sum = Some((1, 1)))); at(7)(_.copy(div = Some(1)))
+      at(4 + d)(_.copy(out = Some((0, 0)))); at(5 + d)(_.copy(out = Some((0, 1))))
+      at(6 + d)(_.copy(in = Some((2, 0)))); at(7 + d)(_.copy(in = Some((2, 1)), out = Some((1, 0))))
+      at(8 + d)(_.copy(out = Some((1, 1)), sum = Some((2, 0)))); at(9 + d)(_.copy(sum = Some((2, 1))))
+      at(10 + d)(_.copy(div = Some(2)))
+      at(10 + 2 * d)(_.copy(out = Some((2, 0)))); at(11 + 2 * d)(_.copy(out = Some((2, 1))))
+
+      for (t <- 0 to plan.keys.max) {
+        val cy = plan(t)
+        dut.io.in.valid.poke(true.B)
+        dut.io.ctrl.op.poke((if (cy.in.nonEmpty) SoftmaxOp.Max else SoftmaxOp.None).U)
+        b.store.poke(cy.in.nonEmpty.B)
+        for ((r, i) <- cy.in) {
+          dut.io.ctrl.stat.poke((r % 2).U)
+          dut.io.ctrl.first.poke((i == 0).B)
+          dut.io.ctrl.lanes.poke(beats(r)(i).length.U)
+          b.beat.poke(i.U)
+          for (l <- 0 until cfg.numLanes) dut.io.in.bits(l).poke(toU(beats(r)(i).lift(l).getOrElse(0x55), 8))
+        }
+        b.sumOp.poke((if (cy.sum.nonEmpty) SoftmaxSumOp.Sum else if (cy.div.nonEmpty) SoftmaxSumOp.Divide
+                      else SoftmaxSumOp.None).U)
+        for ((r, i) <- cy.sum) {
+          b.sumStat.poke((r % 2).U); b.sumBeat.poke(i.U); b.sumFirst.poke((i == 0).B)
+          b.sumLanes.poke(beats(r)(i).length.U)
+        }
+        for (r <- cy.div) b.sumStat.poke((r % 2).U)
+        b.outEn.poke(cy.out.nonEmpty.B)
+        for ((r, i) <- cy.out) {
+          b.outStat.poke((r % 2).U); b.outBeat.poke(i.U); b.outLanes.poke(beats(r)(i).length.U)
+          val exp = expected(r).slice(i * cfg.numLanes, (i + 1) * cfg.numLanes)
+          for (l <- 0 until cfg.numLanes) dut.io.out.bits(l).expect(toU(exp.lift(l).getOrElse(0), 8))
+        }
+        dut.clock.step()
+      }
+    }
+  }
+
   it should "sum to about 1 / out_scale per row (reference sanity check)" in {
     val c = SoftmaxRef.braggnn
     val rnd = new scala.util.Random(9)

@@ -122,4 +122,54 @@ class AccumulatorTest extends AnyFlatSpec with ChiselScalatestTester {
       c.io.readEn.poke(false.B)
     }
   }
+
+  it should "accumulate into one row bank while draining the other in the same cycles (rowBanks = 2)" in {
+    val cuCfg = ComputeUnitConfig(numInputs = 1, numOutputs = 2, inputWidth = 8, weightWidth = 8, outputWidth = 20)
+    val cfg = AccumulatorConfig(cuCfg, numBanks = 2, wordsPerBank = 1, depth = 8, readLatency = 2, writeLatency = 2,
+      rowBanks = 2) // rows 0..3 in bank 0, rows 4..7 in bank 1
+    test(new Accumulator(cfg)) { c =>
+      c.io.shiftAmt.poke(0.U)
+      c.io.groupShift.poke(0.U)
+      c.io.readEn.poke(false.B)
+      def beat(row: Int, v: Seq[Int], acc: Boolean): Unit = {
+        c.io.resultIn.valid.poke(true.B)
+        c.io.accumulate.poke(acc.B)
+        c.io.writeAddr.poke(row.U)
+        for ((x, i) <- v.zipWithIndex) c.io.resultIn.bits(i).poke(x.S(cfg.cu.outputWidth.W))
+      }
+      // initial values: rows 0..3 (bank 0) and 4..7 (bank 1)
+      for (r <- 0 until 8) { beat(r, Seq(r, -r), acc = false); c.clock.step() }
+      c.io.resultIn.valid.poke(false.B)
+      c.clock.step(cfg.commitLatency)
+
+      // cycles 0..3: accumulate +100 into rows 0..3 while draining rows 4..7
+      val drained = scala.collection.mutable.ArrayBuffer.empty[Seq[BigInt]]
+      for (k <- 0 until 4 + cfg.readLatency) {
+        if (k < 4) {
+          beat(k, Seq(100, 100), acc = true)
+          c.io.readAddr.poke((4 + k).U)
+          c.io.readEn.poke(true.B)
+        } else {
+          c.io.resultIn.valid.poke(false.B)
+          c.io.readEn.poke(false.B)
+        }
+        if (c.io.accOut.valid.peek().litToBoolean)
+          drained += (0 until 2).map(i => c.io.accOut.bits(i).peek().litValue)
+        c.clock.step()
+      }
+      def toU(v: Int) = (BigInt(v) & ((BigInt(1) << cfg.cu.outputWidth) - 1))
+      assert(drained.toSeq == (4 until 8).map(r => Seq(toU(r), toU(-r))), s"drained $drained")
+      c.clock.step(cfg.commitLatency)
+
+      // bank 0 rows now hold r + 100, -r + 100
+      c.io.readEn.poke(true.B)
+      for (r <- 0 until 4) {
+        c.io.readAddr.poke(r.U)
+        c.clock.step(cfg.readLatency)
+        c.io.accOut.valid.expect(true.B)
+        c.io.accOut.bits(0).expect(toU(r + 100).U)
+        c.io.accOut.bits(1).expect(toU(100 - r).U)
+      }
+    }
+  }
 }
