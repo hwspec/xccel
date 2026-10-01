@@ -23,10 +23,10 @@ def load_config():
         raise RuntimeError(
             f"Missing config file: {CONFIG_FILE}\n"
             "Please create .gwconfig with:\n"
-            "name=AxiSRV32I\n"
-            "package=srv32i\n"
-            "tests=loop\n"
-            "fpgatest=true"
+            "name=AxiXccelOpt9x64T\n"
+            "package=xccel\n"
+            "tests=braggnn_inference_opt\n"
+            "fpgatest=false"
         )
 
     for raw in CONFIG_FILE.read_text().splitlines():
@@ -60,7 +60,7 @@ AVED = ROOT / f"v80-aved-platform-{PACKAGE}"
 AVED_HW = AVED / "hw/amd_v80_gen5x8_25.1"
 USER_ACCEL = AVED_HW / "src/rtl/user_accel"
 GENERATED = ROOT / "generated" / NAME
-VENV = ROOT / "chisel-axi-utils/.venv"
+VENV = ROOT / "garageworks/.venv"
 
 STATUS_FILE = ROOT / ".gwstatus"
 RESULTS_FILE = ROOT / ".gwstage-results.json"
@@ -351,12 +351,12 @@ def repo():
 
 
 def bridge():
-    run(["make", "-C", "chisel-axi-utils", "setup"])
+    run(["make", "-C", "garageworks", "setup"])
     return {"venv": str(VENV)}
 
 
 def rtlgen():
-    run(["sbt", f"runMain {PACKAGE}.{NAME}"])
+    run(["./mill", "runMain", f"{PACKAGE}.{NAME}"])
 
     if not GENERATED.is_dir():
         raise RuntimeError(
@@ -375,7 +375,7 @@ def cocotb():
 
     for testname in TESTS:
         print(f"\nRunning cocotb test target: {testname}")
-        run(["make", "-C", "tests", testname], env=env)
+        run(["make", "-C", "tests", testname, f"HWMODULENAME={NAME}"], env=env)
 
     return {
         "tests_dir": str(ROOT / "tests"),

@@ -16,7 +16,7 @@ WAVES ?= 1
 # compile the Verilated model in parallel
 BUILD_ARGS ?= -j$(shell nproc)
 
-TARGETS=matmul braggnn_conv braggnn_fc braggnn_nlb1x1 braggnn_nlb_core braggnn_inference braggnn_inference_opt
+TARGETS=matmul braggnn_conv braggnn_fc braggnn_nlb1x1 braggnn_nlb_core braggnn_inference braggnn_inference_opt braggnn_batch
 
 all:
 	make matmul

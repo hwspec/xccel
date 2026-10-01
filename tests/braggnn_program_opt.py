@@ -389,7 +389,7 @@ class OpGraph:
 
 
 def build_opt(m, p, softmax_ops, div_latency, acc_read="shared", softmax_stats=2,
-              partial_weights=True, tile_banks=(), arrays=1, sum_ops=None, tree_latency=0, order="best"):
+              partial_weights=True, tile_banks=(), arrays=1, sum_ops=None, tree_latency=0, order="best", batch=1):
     """partial_weights: load only each weight tile's valid rows and reuse a
     weight slot as soon as its last operand has left the array (10,904 ->
     10,616 cycles with two row banks and four softmax stats).
@@ -401,6 +401,7 @@ def build_opt(m, p, softmax_ops, div_latency, acc_read="shared", softmax_stats=2
     arrays: SystolicArrays in the compute unit (compute_arrays); with 3,
     conv2 and conv3 run one kernel row per pass (lower_conv_rows), with 9 in a
     3 x 3 window and wide weight beats the whole kernel (lower_conv_window).
+    batch: patches one program infers (see the batch loop below).
     order: "program" (place operations in program order), "critical" (list
     scheduling by critical path), "ready" (earliest-ready first), see OpGraph,
     or "best": the shorter of "program" and "critical". The critical-path
@@ -411,7 +412,7 @@ def build_opt(m, p, softmax_ops, div_latency, acc_read="shared", softmax_stats=2
     if order == "best":
         args = (m, p, softmax_ops, div_latency, acc_read, softmax_stats, partial_weights, tile_banks, arrays, sum_ops,
                 tree_latency)
-        return min((build_opt(*args, order=o) for o in ("program", "critical")), key=lambda inf: inf.end)
+        return min((build_opt(*args, order=o, batch=batch) for o in ("program", "critical")), key=lambda inf: inf.end)
     R, C = p.rows, p.cols
     assert R == C, "the Transposer, residual and feedback paths assume a square array"
     CH = 32  # theta / phi / g / attention . g channels
@@ -435,10 +436,13 @@ def build_opt(m, p, softmax_ops, div_latency, acc_read="shared", softmax_stats=2
     if zero_row is not None:
         inf.wb_rows.append((zero_row, [0] * C))
 
+    first = [True]  # building the first patch: record its weights and Requantizer sets
+
     def add_set(scale, bias=None, relu=False):
         s = sets.take(1)
         mult, shift = scale_to_mult_shift(scale)
-        inf.requant.append((s, pad(bias if bias is not None else [], C), [mult] * C, [shift] * C, 0 if relu else -128, 127))
+        if first[0]:
+            inf.requant.append((s, pad(bias if bias is not None else [], C), [mult] * C, [shift] * C, 0 if relu else -128, 127))
         return s
 
     def lower(kind, x_shape, w, b, scale, relu, ab_base, acc_base, acc_bases=None):
@@ -460,8 +464,10 @@ def build_opt(m, p, softmax_ops, div_latency, acc_read="shared", softmax_stats=2
         wb.take(len(low.wb_rows))
         for s in low.requant:
             sets.take(1)
-            inf.requant.append(s)
-        inf.wb_rows.extend(low.wb_rows)
+            if first[0]:
+                inf.requant.append(s)
+        if first[0]:
+            inf.wb_rows.extend(low.wb_rows)
         return low
 
     def run_passes(passes):
@@ -498,227 +504,256 @@ def build_opt(m, p, softmax_ops, div_latency, acc_read="shared", softmax_stats=2
     # Accumulator regions alternate between the two halves (banks) so a layer's
     # drain and the next layer's accumulation use different banks
     B0, B1 = 0, half
-    inf.conv1_ab_base = ab.take(N)
-    sch.layer = "conv1"
-    ab_c1 = conv_layer("im2col", (11, 11, 1), m.w["conv1"], m.b["conv1"], m.scale["conv1"], False,
-                       inf.conv1_ab_base, B0)                                      # B0 0..323
-    sch.layer = "theta"
-    ab_th = conv_layer("kn2row", (9, 9, 64), m.w["theta"], m.b["theta"], m.scale["theta"], False,
-                       ab_c1, B1)                                                  # B1 0..161
+    # Batch: `batch` patches in one program. Weights and Requantizer sets are
+    # the first patch's; every patch has its own conv1 input rows (the host
+    # writes them all before start) and output row; the other activations
+    # use two ActivationBuffer regions, even and odd patches alternating, so
+    # consecutive patches can overlap. Accumulator regions and the on-chip
+    # written WeightBuffer rows (phi^T, g) are shared: the operation graph
+    # orders their reuse.
+    conv1_bases = [ab.take(N) for _ in range(batch)]
+    wb_start, sets_start, ab_start = wb.next, sets.next, ab.next
+    act_rows, ab_high, out_rows = 0, ab.next, []
+    def one_patch(k, prefix):
+        """Record one patch's operations (its own scope: the recorded
+        closures run later, in g.run, and must see this patch's rows)."""
+        sch.layer = prefix + "conv1"
+        ab_c1 = conv_layer("im2col", (11, 11, 1), m.w["conv1"], m.b["conv1"], m.scale["conv1"], False,
+                           conv1_bases[k], B0)                                      # B0 0..323
+        sch.layer = prefix + "theta"
+        ab_th = conv_layer("kn2row", (9, 9, 64), m.w["theta"], m.b["theta"], m.scale["theta"], False,
+                           ab_c1, B1)                                                  # B1 0..161
 
-    sch.layer = "phi + phi^T"
-    PHI = B1 + 2 * N
-    low_phi = lower("kn2row", (9, 9, 64), m.w["phi"], m.b["phi"], m.scale["phi"], False, ab_c1, PHI)
-    run_passes(low_phi.passes)                                                     # B1 162..323
-    phi_sets = [s[0] for s in low_phi.requant]
-    wb_pt = wb.take(njt * nct * R)
-    def phi_t_block(jt, ct):
-        pixels = list(range(jt * C, min(N, (jt + 1) * C)))
-        cols = [wb_pt + (jt * nct + ct) * R + c for c in range(min(R, CH - ct * R))]  # the tile's channels
+        sch.layer = prefix + "phi + phi^T"
+        PHI = B1 + 2 * N
+        low_phi = lower("kn2row", (9, 9, 64), m.w["phi"], m.b["phi"], m.scale["phi"], False, ab_c1, PHI)
+        run_passes(low_phi.passes)                                                     # B1 162..323
+        phi_sets = [s[0] for s in low_phi.requant]
+        wb_pt = wb.take(njt * nct * R)
+        def phi_t_block(jt, ct):
+            pixels = list(range(jt * C, min(N, (jt + 1) * C)))
+            cols = [wb_pt + (jt * nct + ct) * R + c for c in range(min(R, CH - ct * R))]  # the tile's channels
 
-        def place():
-            last = 0
-            for r, j in enumerate(pixels):
-                last = sch.schedule_drain(PHI + ct * N + j, {"requant.paramSet": phi_sets[ct], "transposer.capture": 1,
-                                                             "transposer.row": r},
-                                          lower=sch.transposer_free - acc_rl, resources=("transposer",))
-            t = last + 1
-            for c, row in enumerate(cols):
-                t = sch.fit(t, lambda x: [("wbWrite", x)])
-                sch.claim([("wbWrite", t)])
-                tb.put(t, {"wbWrite.en": 1, "wbWrite.addr": row, "wbWrite.transposed": 1, "wbWrite.column": c})
-                sch.wb_ready[row] = t + p.wb_write_latency + 1
+            def place():
+                last = 0
+                for r, j in enumerate(pixels):
+                    last = sch.schedule_drain(PHI + ct * N + j, {"requant.paramSet": phi_sets[ct], "transposer.capture": 1,
+                                                                 "transposer.row": r},
+                                              lower=sch.transposer_free - acc_rl, resources=("transposer",))
+                t = last + 1
+                for c, row in enumerate(cols):
+                    t = sch.fit(t, lambda x: [("wbWrite", x)])
+                    sch.claim([("wbWrite", t)])
+                    tb.put(t, {"wbWrite.en": 1, "wbWrite.addr": row, "wbWrite.transposed": 1, "wbWrite.column": c})
+                    sch.wb_ready[row] = t + p.wb_write_latency + 1
+                    t += 1
+                sch.transposer_free = t  # the next block's first capture arrives after the last column read
+            g.add(place, reads=[("acc", PHI + ct * N + j) for j in pixels],
+                  writes=[("wb", r) for r in cols] + [("tok", "transposer")],
+                  est=len(pixels) + len(cols) + acc_rl + p.wb_write_latency + 2)
+
+        for jt in range(njt):
+            for ct in range(nct):
+                phi_t_block(jt, ct)
+
+        sch.layer = prefix + "theta.phi^T"
+        logit_set = add_set(m.scale["theta_phi"])
+        LOG = B0  # reuses conv1's region (drained)
+        run_passes([{"ab": [ab_th + ct * N + i for i in range(N)], "wb": wb_pt + (jt * nct + ct) * R,
+                     "acc": [LOG + jt * N + i for i in range(N)], "accumulate": ct > 0, "wrows": min(R, CH - ct * R)}
+                    for jt in range(njt) for ct in range(nct)])                           # B0 0..485
+
+        sch.layer = prefix + "softmax"
+        ab_att = ab.take(njt * N)
+        smops = softmax_ops
+        row_beats = getattr(p, "softmax_row_beats", 0)
+        lanes = [min(C, N - jt * C) for jt in range(njt)]
+
+        def softmax_row_buffered(row, stat):
+            # row buffer: one drain per beat (Max, kept in the buffer); the sum and
+            # out stages read the buffer through their own fields, so they overlap
+            # other rows' drains
+            last = sch.stat_free[stat] - 1
+            for jt in range(njt):
+                last = sch.schedule_drain(LOG + jt * N + row, {
+                    "requant.paramSet": logit_set, "softmax.op": smops["Max"], "softmax.first": int(jt == 0),
+                    "softmax.lanes": lanes[jt], "softmax.stat": stat, "softmax.buf.store": 1, "softmax.buf.beat": jt},
+                    lower=last + 1 - acc_rl, resources=("softmax",), post=False)
+            t = last + 1  # the row's max and last beat are in
+            for jt in range(njt + 1):  # Sum beats, then Divide
+                t = sch.fit(t, lambda x: [("softmaxSum", x)])
+                sch.claim([("softmaxSum", t)])
+                if jt < njt:
+                    tb.put(t, {"softmax.buf.sumOp": sum_ops["Sum"], "softmax.buf.sumStat": stat, "softmax.buf.sumBeat": jt,
+                               "softmax.buf.sumFirst": int(jt == 0), "softmax.buf.sumLanes": lanes[jt]})
+                else:
+                    tb.put(t, {"softmax.buf.sumOp": sum_ops["Divide"], "softmax.buf.sumStat": stat})
                 t += 1
-            sch.transposer_free = t  # the next block's first capture arrives after the last column read
-        g.add(place, reads=[("acc", PHI + ct * N + j) for j in pixels],
-              writes=[("wb", r) for r in cols] + [("tok", "transposer")],
-              est=len(pixels) + len(cols) + acc_rl + p.wb_write_latency + 2)
+            t += div_latency - 1
+            for jt in range(njt):
+                dst = ab_att + jt * N + row
+                t = sch.fit(t, lambda x: [("softmaxOut", x), ("post", x), ("abWrite", x)])
+                sch.claim([("softmaxOut", t), ("post", t), ("abWrite", t)])
+                tb.put(t, {"softmax.buf.outEn": 1, "softmax.buf.outStat": stat, "softmax.buf.outBeat": jt,
+                           "softmax.buf.outLanes": lanes[jt], "abWrite.en": 1, "abWrite.addr": dst,
+                           "abWrite.fromRequantizer": 1})
+                sch.ab_ready[dst] = t + p.ab_write_latency + 1
+                sch.trace.append((sch.layer, "out", t, t))
+                sch.end = max(sch.end, t + 1)
+                t += 1
+            sch.stat_free[stat] = t
 
-    for jt in range(njt):
-        for ct in range(nct):
-            phi_t_block(jt, ct)
+        def softmax_row_drains(row, stat):
+            def beat(op, jt, extra=None):
+                return {"requant.paramSet": logit_set, "softmax.op": op, "softmax.first": int(jt == 0),
+                        "softmax.lanes": lanes[jt], "softmax.stat": stat, **(extra or {})}
+            # Max beats: the stat slot must be free (its previous row fully out)
+            last = sch.stat_free[stat] - 1
+            for jt in range(njt):
+                last = sch.schedule_drain(LOG + jt * N + row, beat(smops["Max"], jt), lower=last + 1 - acc_rl,
+                                          resources=("softmax",))
+            for jt in range(njt):  # Sum beats after every Max beat has arrived
+                last = sch.schedule_drain(LOG + jt * N + row, beat(smops["Sum"], jt), lower=last + 1 - acc_rl,
+                                          resources=("softmax",))
+            d = sch.fit(last + 1, lambda x: [("softmax", x)])
+            sch.claim([("softmax", d)])
+            tb.put(d, {"softmax.op": smops["Divide"], "softmax.stat": stat})
+            last = d + div_latency - 1
+            for jt in range(njt):
+                dst = ab_att + jt * N + row
+                last = sch.schedule_drain(LOG + jt * N + row, beat(smops["Out"], jt, {
+                    "abWrite.en": 1, "abWrite.addr": dst, "abWrite.fromRequantizer": 1}),
+                    lower=last + 1 - acc_rl, resources=("softmax",), writes_ab=dst)
+            sch.stat_free[stat] = last + 1
 
-    sch.layer = "theta.phi^T"
-    logit_set = add_set(m.scale["theta_phi"])
-    LOG = B0  # reuses conv1's region (drained)
-    run_passes([{"ab": [ab_th + ct * N + i for i in range(N)], "wb": wb_pt + (jt * nct + ct) * R,
-                 "acc": [LOG + jt * N + i for i in range(N)], "accumulate": ct > 0, "wrows": min(R, CH - ct * R)}
-                for jt in range(njt) for ct in range(nct)])                           # B0 0..485
+        if row_beats:
+            assert row_beats >= njt
+        for row in range(N):
+            stat = row % softmax_stats
+            place = softmax_row_buffered if row_beats else softmax_row_drains
+            g.add(lambda row=row, stat=stat, place=place: place(row, stat),
+                  reads=[("acc", LOG + jt * N + row) for jt in range(njt)],
+                  writes=[("ab", ab_att + jt * N + row) for jt in range(njt)] + [("tok", f"stat{stat}")],
+                  est=(njt if row_beats else 3 * njt) + div_latency + 2 * njt + acc_rl + 4)
 
-    sch.layer = "softmax"
-    ab_att = ab.take(njt * N)
-    smops = softmax_ops
-    row_beats = getattr(p, "softmax_row_beats", 0)
-    lanes = [min(C, N - jt * C) for jt in range(njt)]
+        sch.layer = prefix + "g -> WB"
+        G = B1 + 4 * N  # B1 324..485
+        low_g = lower("kn2row", (9, 9, 64), m.w["g"], m.b["g"], m.scale["g"], False, ab_c1, G)
+        run_passes(low_g.passes)
+        g_sets = [s[0] for s in low_g.requant]
+        wb_g = wb.take(nct * njt * R)
+        for cot in range(nct):
+            for j in range(N):
+                dst = wb_g + (cot * njt + j // R) * R + j % R
+                drain(G + cot * N + j, {"requant.paramSet": g_sets[cot], "wbWrite.en": 1,
+                                        "wbWrite.fromRequantizer": 1, "wbWrite.addr": dst}, writes_wb=dst)
 
-    def softmax_row_buffered(row, stat):
-        # row buffer: one drain per beat (Max, kept in the buffer); the sum and
-        # out stages read the buffer through their own fields, so they overlap
-        # other rows' drains
-        last = sch.stat_free[stat] - 1
-        for jt in range(njt):
-            last = sch.schedule_drain(LOG + jt * N + row, {
-                "requant.paramSet": logit_set, "softmax.op": smops["Max"], "softmax.first": int(jt == 0),
-                "softmax.lanes": lanes[jt], "softmax.stat": stat, "softmax.buf.store": 1, "softmax.buf.beat": jt},
-                lower=last + 1 - acc_rl, resources=("softmax",), post=False)
-        t = last + 1  # the row's max and last beat are in
-        for jt in range(njt + 1):  # Sum beats, then Divide
-            t = sch.fit(t, lambda x: [("softmaxSum", x)])
-            sch.claim([("softmaxSum", t)])
-            if jt < njt:
-                tb.put(t, {"softmax.buf.sumOp": sum_ops["Sum"], "softmax.buf.sumStat": stat, "softmax.buf.sumBeat": jt,
-                           "softmax.buf.sumFirst": int(jt == 0), "softmax.buf.sumLanes": lanes[jt]})
-            else:
-                tb.put(t, {"softmax.buf.sumOp": sum_ops["Divide"], "softmax.buf.sumStat": stat})
-            t += 1
-        t += div_latency - 1
-        for jt in range(njt):
-            dst = ab_att + jt * N + row
-            t = sch.fit(t, lambda x: [("softmaxOut", x), ("post", x), ("abWrite", x)])
-            sch.claim([("softmaxOut", t), ("post", t), ("abWrite", t)])
-            tb.put(t, {"softmax.buf.outEn": 1, "softmax.buf.outStat": stat, "softmax.buf.outBeat": jt,
-                       "softmax.buf.outLanes": lanes[jt], "abWrite.en": 1, "abWrite.addr": dst,
-                       "abWrite.fromRequantizer": 1})
-            sch.ab_ready[dst] = t + p.ab_write_latency + 1
-            sch.trace.append((sch.layer, "out", t, t))
-            sch.end = max(sch.end, t + 1)
-            t += 1
-        sch.stat_free[stat] = t
+        sch.layer = prefix + "attention.g"
+        ag_set = add_set(m.scale["attention_g"])
+        AG = B1  # reuses theta's region (drained)
+        # the last pixel tile has one valid row (pixel 80); attention is 0 on the other lanes
+        run_passes([{"ab": [ab_att + jt * N + i for i in range(N)], "wb": wb_g + (cot * njt + jt) * R,
+                     "acc": [AG + cot * N + i for i in range(N)], "accumulate": jt > 0, "wrows": min(R, N - jt * R)}
+                    for cot in range(nct) for jt in range(njt)])
+        ab_ag = ab.take(nct * N)
+        drain_to_ab([AG + k for k in range(nct * N)], lambda k: ag_set, [ab_ag + k for k in range(nct * N)])
 
-    def softmax_row_drains(row, stat):
-        def beat(op, jt, extra=None):
-            return {"requant.paramSet": logit_set, "softmax.op": op, "softmax.first": int(jt == 0),
-                    "softmax.lanes": lanes[jt], "softmax.stat": stat, **(extra or {})}
-        # Max beats: the stat slot must be free (its previous row fully out)
-        last = sch.stat_free[stat] - 1
-        for jt in range(njt):
-            last = sch.schedule_drain(LOG + jt * N + row, beat(smops["Max"], jt), lower=last + 1 - acc_rl,
-                                      resources=("softmax",))
-        for jt in range(njt):  # Sum beats after every Max beat has arrived
-            last = sch.schedule_drain(LOG + jt * N + row, beat(smops["Sum"], jt), lower=last + 1 - acc_rl,
-                                      resources=("softmax",))
-        d = sch.fit(last + 1, lambda x: [("softmax", x)])
-        sch.claim([("softmax", d)])
-        tb.put(d, {"softmax.op": smops["Divide"], "softmax.stat": stat})
-        last = d + div_latency - 1
-        for jt in range(njt):
-            dst = ab_att + jt * N + row
-            last = sch.schedule_drain(LOG + jt * N + row, beat(smops["Out"], jt, {
-                "abWrite.en": 1, "abWrite.addr": dst, "abWrite.fromRequantizer": 1}),
-                lower=last + 1 - acc_rl, resources=("softmax",), writes_ab=dst)
-        sch.stat_free[stat] = last + 1
+        sch.layer = prefix + "nlb_out"
+        NO = B0  # reuses the logits' region (drained)
+        # with tile_banks, tiles 1 and 3 go to bank 1, reusing attention . g's region (drained)
+        no_bases = [NO, AG, NO + N, AG + N] if tile_banks is True or "nlb_out" in (tile_banks or ()) else None
+        ab_no = conv_layer("kn2row", (9, 9, 32), m.w["nlb_out"], m.b["nlb_out"], m.scale["nlb_out"], False, ab_ag, NO,
+                           no_bases)
 
-    if row_beats:
-        assert row_beats >= njt
-    for row in range(N):
-        stat = row % softmax_stats
-        place = softmax_row_buffered if row_beats else softmax_row_drains
-        g.add(lambda row=row, stat=stat, place=place: place(row, stat),
-              reads=[("acc", LOG + jt * N + row) for jt in range(njt)],
-              writes=[("ab", ab_att + jt * N + row) for jt in range(njt)] + [("tok", f"stat{stat}")],
-              est=(njt if row_beats else 3 * njt) + div_latency + 2 * njt + acc_rl + 4)
+        sch.layer = prefix + "resadd"
+        ma, sa = scale_to_mult_shift(m.scale["resadd_a"])
+        mb, sb = scale_to_mult_shift(m.scale["resadd_b"])
+        inf.residual = [(0, [0] * C, [ma] * C, [sa] * C, -128, 127), (1, [0] * C, [mb] * C, [sb] * C, -128, 127)]
+        RS = B1 + 2 * N  # B1 162..485 (phi / g regions, drained)
+        def resadd_chunk(ct, base, pset):
+            pairs = [(base + ct * N + i, RS + ct * N + i) for i in range(N)]
 
-    sch.layer = "g -> WB"
-    G = B1 + 4 * N  # B1 324..485
-    low_g = lower("kn2row", (9, 9, 64), m.w["g"], m.b["g"], m.scale["g"], False, ab_c1, G)
-    run_passes(low_g.passes)
-    g_sets = [s[0] for s in low_g.requant]
-    wb_g = wb.take(nct * njt * R)
-    for cot in range(nct):
-        for j in range(N):
-            dst = wb_g + (cot * njt + j // R) * R + j % R
-            drain(G + cot * N + j, {"requant.paramSet": g_sets[cot], "wbWrite.en": 1,
-                                    "wbWrite.fromRequantizer": 1, "wbWrite.addr": dst}, writes_wb=dst)
+            def place():
+                t = 0
+                for src, dst in pairs:
+                    lower_t = max(t, sch.ab_ready.get(src, 0),
+                                  sch.acc_read_last.get(dst, -1) + 1 - ab_rl,
+                                  sch.acc_written.get(dst, -10**9) + (sch.commit if pset else 1) - ab_rl)
 
-    sch.layer = "attention.g"
-    ag_set = add_set(m.scale["attention_g"])
-    AG = B1  # reuses theta's region (drained)
-    # the last pixel tile has one valid row (pixel 80); attention is 0 on the other lanes
-    run_passes([{"ab": [ab_att + jt * N + i for i in range(N)], "wb": wb_g + (cot * njt + jt) * R,
-                 "acc": [AG + cot * N + i for i in range(N)], "accumulate": jt > 0, "wrows": min(R, N - jt * R)}
-                for cot in range(nct) for jt in range(njt)])
-    ab_ag = ab.take(nct * N)
-    drain_to_ab([AG + k for k in range(nct * N)], lambda k: ag_set, [ab_ag + k for k in range(nct * N)])
+                    def uses(x, dst=dst):
+                        u = [("abRead", x), ("accWrite", x + ab_rl), ("residual", x + ab_rl)]
+                        if pset:
+                            u.append((sch.acc_port(dst), x + ab_rl))
+                        return u
+                    x = sch.fit(lower_t, uses)
+                    sch.claim(uses(x))
+                    tb.put(x, {"abRead.en": 1, "abRead.addr": src})
+                    tb.put(x + ab_rl, {"residual.en": 1, "residual.paramSet": pset, "accWrite.addr": dst,
+                                       "accWrite.accumulate": pset})
+                    sch.acc_written[dst] = x + ab_rl
+                    sch.trace.append((sch.layer, "stream", x, x))
+                    sch.end = max(sch.end, x + ab_rl + 1)
+                    t = x + 1
+            acc_rows = [("acc", d) for _, d in pairs]
+            g.add(place, reads=[("ab", s_) for s_, _ in pairs] + (acc_rows if pset else []), writes=acc_rows,
+                  est=N + ab_rl + sch.commit + 2)
 
-    sch.layer = "nlb_out"
-    NO = B0  # reuses the logits' region (drained)
-    # with tile_banks, tiles 1 and 3 go to bank 1, reusing attention . g's region (drained)
-    no_bases = [NO, AG, NO + N, AG + N] if tile_banks is True or "nlb_out" in (tile_banks or ()) else None
-    ab_no = conv_layer("kn2row", (9, 9, 32), m.w["nlb_out"], m.b["nlb_out"], m.scale["nlb_out"], False, ab_ag, NO,
-                       no_bases)
+        for ct in range(nrs):
+            for base, pset in ((ab_c1, 0), (ab_no, 1)):
+                resadd_chunk(ct, base, pset)
+        rs_set = add_set(m.scale["resadd_c"], relu=True)
+        ab_rs = ab.take(nrs * N)
+        drain_to_ab([RS + k for k in range(nrs * N)], lambda k: rs_set, [ab_rs + k for k in range(nrs * N)])
 
-    sch.layer = "resadd"
-    ma, sa = scale_to_mult_shift(m.scale["resadd_a"])
-    mb, sb = scale_to_mult_shift(m.scale["resadd_b"])
-    inf.residual = [(0, [0] * C, [ma] * C, [sa] * C, -128, 127), (1, [0] * C, [mb] * C, [sb] * C, -128, 127)]
-    RS = B1 + 2 * N  # B1 162..485 (phi / g regions, drained)
-    def resadd_chunk(ct, base, pset):
-        pairs = [(base + ct * N + i, RS + ct * N + i) for i in range(N)]
+        # with tile_banks, tile 1 goes to bank 1 (theta / attention . g's region, drained)
+        sch.layer = prefix + "conv2"
+        c2_bases = [B0 + 324, B1] if tile_banks is True or "conv2" in (tile_banks or ()) else None
+        if arrays == 9 and kernel_cols == 3 and wide:
+            kxk = "window"
+        elif arrays == 3 and kernel_cols == 3:
+            kxk = "rows"
+        else:
+            kxk = "kn2row"
+        ab_c2 = conv_layer(kxk, (9, 9, 64), m.w["conv2"], m.b["conv2"], m.scale["conv2"], True, ab_rs, B0 + 324,
+                           c2_bases)
+        sch.layer = prefix + "conv3"
+        ab_c3 = conv_layer(kxk, (7, 7, 32), m.w["conv3"], m.b["conv3"], m.scale["conv3"], True, ab_c2, B1 + 486)
+        sch.layer = prefix + "fc1"
+        # with the 3 x 3 window, fc1 (a 5x5 kernel over the whole 5x5 conv3 output)
+        # takes four kernel-tile passes instead of 25 one-beat passes
+        ab_x = conv_layer("window" if kxk == "window" else "kn2row", (5, 5, 8), fc_as_conv(m.w["fc1"].reshape(16, -1), 5, 5), m.b["fc1"], m.scale["fc1"],
+                          True, ab_c3, B0 + 422)
+        sch.layer = prefix + "fc2..fc4"
+        for acc_row, name in zip((B1 + 511, B0 + 423, B1 + 510), ("fc2", "fc3", "fc4")):
+            w = fc_as_conv(m.w[name], 1, 1)
+            ab_x = conv_layer("kn2row", (1, 1, w.shape[2]), w, m.b[name], m.scale[name], True, ab_x, acc_row)
+        sch.layer = prefix + "output"
+        w = fc_as_conv(m.w["output"], 1, 1)
+        OUT = B0 + 424 + k  # one output row per patch (unused by the other layers)
+        low_out = lower("kn2row", (1, 1, 2), w, m.b["output"], m.scale["output"], False, ab_x, OUT)
+        run_passes(low_out.passes)
+        return OUT, low_out
 
-        def place():
-            t = 0
-            for src, dst in pairs:
-                lower_t = max(t, sch.ab_ready.get(src, 0),
-                              sch.acc_read_last.get(dst, -1) + 1 - ab_rl,
-                              sch.acc_written.get(dst, -10**9) + (sch.commit if pset else 1) - ab_rl)
-
-                def uses(x, dst=dst):
-                    u = [("abRead", x), ("accWrite", x + ab_rl), ("residual", x + ab_rl)]
-                    if pset:
-                        u.append((sch.acc_port(dst), x + ab_rl))
-                    return u
-                x = sch.fit(lower_t, uses)
-                sch.claim(uses(x))
-                tb.put(x, {"abRead.en": 1, "abRead.addr": src})
-                tb.put(x + ab_rl, {"residual.en": 1, "residual.paramSet": pset, "accWrite.addr": dst,
-                                   "accWrite.accumulate": pset})
-                sch.acc_written[dst] = x + ab_rl
-                sch.trace.append((sch.layer, "stream", x, x))
-                sch.end = max(sch.end, x + ab_rl + 1)
-                t = x + 1
-        acc_rows = [("acc", d) for _, d in pairs]
-        g.add(place, reads=[("ab", s_) for s_, _ in pairs] + (acc_rows if pset else []), writes=acc_rows,
-              est=N + ab_rl + sch.commit + 2)
-
-    for ct in range(nrs):
-        for base, pset in ((ab_c1, 0), (ab_no, 1)):
-            resadd_chunk(ct, base, pset)
-    rs_set = add_set(m.scale["resadd_c"], relu=True)
-    ab_rs = ab.take(nrs * N)
-    drain_to_ab([RS + k for k in range(nrs * N)], lambda k: rs_set, [ab_rs + k for k in range(nrs * N)])
-
-    # with tile_banks, tile 1 goes to bank 1 (theta / attention . g's region, drained)
-    sch.layer = "conv2"
-    c2_bases = [B0 + 324, B1] if tile_banks is True or "conv2" in (tile_banks or ()) else None
-    if arrays == 9 and kernel_cols == 3 and wide:
-        kxk = "window"
-    elif arrays == 3 and kernel_cols == 3:
-        kxk = "rows"
-    else:
-        kxk = "kn2row"
-    ab_c2 = conv_layer(kxk, (9, 9, 64), m.w["conv2"], m.b["conv2"], m.scale["conv2"], True, ab_rs, B0 + 324,
-                       c2_bases)
-    sch.layer = "conv3"
-    ab_c3 = conv_layer(kxk, (7, 7, 32), m.w["conv3"], m.b["conv3"], m.scale["conv3"], True, ab_c2, B1 + 486)
-    sch.layer = "fc1"
-    # with the 3 x 3 window, fc1 (a 5x5 kernel over the whole 5x5 conv3 output)
-    # takes four kernel-tile passes instead of 25 one-beat passes
-    ab_x = conv_layer("window" if kxk == "window" else "kn2row", (5, 5, 8), fc_as_conv(m.w["fc1"].reshape(16, -1), 5, 5), m.b["fc1"], m.scale["fc1"],
-                      True, ab_c3, B0 + 422)
-    sch.layer = "fc2..fc4"
-    for acc_row, name in zip((B1 + 511, B0 + 423, B1 + 510), ("fc2", "fc3", "fc4")):
-        w = fc_as_conv(m.w[name], 1, 1)
-        ab_x = conv_layer("kn2row", (1, 1, w.shape[2]), w, m.b[name], m.scale[name], True, ab_x, acc_row)
-    sch.layer = "output"
-    w = fc_as_conv(m.w["output"], 1, 1)
-    OUT = B0 + 424
-    low_out = lower("kn2row", (1, 1, 2), w, m.b["output"], m.scale["output"], False, ab_x, OUT)
-    run_passes(low_out.passes)
+    for k in range(batch):
+        wb.next, sets.next = wb_start, sets_start
+        ab.next = ab_start + (k % 2) * act_rows
+        first[0] = k == 0
+        OUT, low_out = one_patch(k, f"p{k} " if batch > 1 else "")
+        if k == 0:
+            act_rows = ab.next - ab_start
+        ab_high = max(ab_high, ab.next)
+        out_rows.append(OUT)
     g.run(order)
     inf.end = sch.end
-    inf.output_acc_row, inf.output_set = OUT, low_out.requant[0][0]
+    inf.output_acc_row, inf.output_set = out_rows[0], low_out.requant[0][0]
+    inf.output_acc_rows, inf.conv1_ab_base, inf.conv1_ab_bases = out_rows, conv1_bases[0], conv1_bases
+    # an output row's last write must be its patch's output pass (a later
+    # layer or patch must not overwrite it before the host reads it)
+    out_cycles = [b for l, kind, a, b in sch.trace if l.endswith("output") and kind == "results"]
+    for r, c in zip(out_rows, out_cycles):
+        assert sch.acc_written[r] == c, f"Accumulator row {r} overwritten after its patch's output"
     tb.pad(inf.end)
-    inf.usage = {"wb_rows": wb.next, "ab_rows": ab.next, "requant_sets": sets.next}
+    inf.usage = {"wb_rows": wb.next, "ab_rows": ab_high, "requant_sets": sets.next}
     inf.order = order
     inf.trace = sch.trace
     return inf
