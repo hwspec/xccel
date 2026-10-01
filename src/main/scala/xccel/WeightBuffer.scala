@@ -11,15 +11,15 @@ case class WeightBufferConfig(
   readLatency: Int,
   writeLatency: Int,
   portType: BankPortType = BankPortType.OneRW,
-  // words per weight beat handed to the compute unit (its weightBeatElems);
+  // lanes of the weight beat handed to the compute unit (its weightBeatElems);
   // 0 = cu.numOutputs (one array row per beat)
-  weightPorts: Int = 0,
+  weightLanes: Int = 0,
 ) {
   require(tiles > 0, "tiles must be positive")
   require(wordsPerBank > 0, "wordsPerBank must be positive")
 
   val totalWordsPerRow: Int = numBanks * wordsPerBank
-  val numWeightPorts: Int = if (weightPorts > 0) weightPorts else cu.numOutputs
+  val numWeightLanes: Int = if (weightLanes > 0) weightLanes else cu.numOutputs
   val rowsTotal: Int = cu.numInputs * tiles
 
   val sram: SramConfig = SramConfig(
@@ -33,11 +33,11 @@ case class WeightBufferConfig(
     portType = portType,
   )
 
-  val adapter: PortAdapterConfig = PortAdapterConfig(
-    totalGrains = totalWordsPerRow,
-    grainWidth = cu.weightWidth,
-    numPorts = numWeightPorts,
-    grainsPerPort = 1,
+  val laneSwitch: LaneSwitchConfig = LaneSwitchConfig(
+    numIn = totalWordsPerRow,
+    numOut = numWeightLanes,
+    inPerOut = 1,
+    laneWidth = cu.weightWidth,
   )
 }
 
@@ -49,11 +49,11 @@ class WeightBufferIO(cfg: WeightBufferConfig) extends Bundle {
   val writeAddr = Input(UInt(cfg.sram.addrWidth.W))
   val writeEn = Input(Bool())
   val wdata = Input(Vec(cfg.totalWordsPerRow, UInt(cfg.cu.weightWidth.W)))
-  val shiftAmt = Input(UInt(cfg.adapter.shiftWidth.W))
-  val groupShift = Input(UInt(cfg.adapter.groupShiftWidth.W))
+  val shiftAmt = Input(UInt(cfg.laneSwitch.shiftWidth.W))
+  val groupShift = Input(UInt(cfg.laneSwitch.groupShiftWidth.W))
 
   // one weight beat of the compute unit (HasStationaryWeights.weightWriteData)
-  val weightOut = Valid(Vec(cfg.numWeightPorts, UInt(cfg.cu.weightWidth.W)))
+  val weightOut = Valid(Vec(cfg.numWeightLanes, UInt(cfg.cu.weightWidth.W)))
 }
 
 class WeightBuffer(cfg: WeightBufferConfig) extends Module {
@@ -80,10 +80,10 @@ class WeightBuffer(cfg: WeightBufferConfig) extends Module {
     (0 until cfg.wordsPerBank).map(i => wordSlice(rdata(n), i))
   })
 
-  private val shiftAmtPipe = ShiftRegister(io.shiftAmt, cfg.readLatency, 0.U(cfg.adapter.shiftWidth.W), true.B)
+  private val shiftAmtPipe = ShiftRegister(io.shiftAmt, cfg.readLatency, 0.U(cfg.laneSwitch.shiftWidth.W), true.B)
   private val groupShiftPipe =
-    ShiftRegister(io.groupShift, cfg.readLatency, 0.U(cfg.adapter.groupShiftWidth.W), true.B)
+    ShiftRegister(io.groupShift, cfg.readLatency, 0.U(cfg.laneSwitch.groupShiftWidth.W), true.B)
 
-  io.weightOut.bits := PortAdapter.connect(cfg.adapter, flatWords, shiftAmtPipe, groupShiftPipe)
+  io.weightOut.bits := LaneSwitch.connect(cfg.laneSwitch, flatWords, shiftAmtPipe, groupShiftPipe)
   io.weightOut.valid := ShiftRegister(io.readEn, cfg.readLatency, false.B, true.B)
 }

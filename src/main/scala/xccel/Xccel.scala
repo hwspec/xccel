@@ -38,8 +38,8 @@ case class XccelConfig(
   // the compute unit's weight beats: how many, and how many words each
   val weightBeats: Int = if (computeArrays == 1 || wideWeights) cu.numInputs else computeArrays * cu.numInputs
   val weightBeatElems: Int = if (wideWeights) computeArrays * cu.numOutputs else cu.numOutputs
-  require(weightBuffer.numWeightPorts == weightBeatElems,
-    s"weightBuffer.weightPorts must be the compute unit's weight beat ($weightBeatElems words)")
+  require(weightBuffer.numWeightLanes == weightBeatElems,
+    s"weightBuffer.weightLanes must be the compute unit's weight beat ($weightBeatElems lanes)")
 
   val requantizer: RequantizerConfig =
     RequantizerConfig(cu.numOutputs, cu.outputWidth, requantizedWidth, requantMultWidth, requantParamSets)

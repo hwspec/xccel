@@ -30,8 +30,8 @@ class WeightBufferSystolicHarness(
     val wbEn = Input(Bool())
     val wbWen = Input(Bool())
     val wbWdata = Input(Vec(wbCfg.totalWordsPerRow, UInt(cuCfg.weightWidth.W)))
-    val wbShiftAmt = Input(UInt(wbCfg.adapter.shiftWidth.W))
-    val wbGroupShift = Input(UInt(wbCfg.adapter.groupShiftWidth.W))
+    val wbShiftAmt = Input(UInt(wbCfg.laneSwitch.shiftWidth.W))
+    val wbGroupShift = Input(UInt(wbCfg.laneSwitch.groupShiftWidth.W))
 
     val operandIn = Flipped(Valid(Vec(cuCfg.numInputs, UInt(cuCfg.inputWidth.W))))
     val resultOut = Valid(Vec(cuCfg.numOutputs, SInt(cuCfg.outputWidth.W)))
@@ -173,7 +173,7 @@ class WeightBufferTest extends AnyFlatSpec with ChiselScalatestTester {
     }
   }
 
-  it should "broadcast a single grain to every port when groupShift = log2(cols)" in {
+  it should "broadcast one input lane to every output lane when groupShift = log2(cols)" in {
     val cuCfg = ComputeUnitConfig(numInputs = 2, numOutputs = 4, inputWidth = 8, weightWidth = 8, outputWidth = 20)
     val cfg =
       WeightBufferConfig(cuCfg, numBanks = 4, wordsPerBank = 1, tiles = 1, readLatency = 1, writeLatency = 1)
@@ -225,7 +225,7 @@ class WeightBufferTest extends AnyFlatSpec with ChiselScalatestTester {
       c.clock.step(cfg.readLatency)
 
       c.io.weightOut.valid.expect(true.B)
-      // ports 0,1 share grain 0; ports 2,3 share grain 1
+      // output lanes 0,1 share input lane 0; 2,3 share input lane 1
       val expected = Seq(row(0), row(0), row(1), row(1))
       for (i <- row.indices) c.io.weightOut.bits(i).expect(expected(i).U)
       c.io.readEn.poke(false.B)

@@ -21,8 +21,8 @@ class ActivationBufferSystolicHarness(
     val abEn = Input(Bool())
     val abWen = Input(Bool())
     val abWdata = Input(Vec(abCfg.totalWordsPerRow, UInt(cuCfg.inputWidth.W)))
-    val abShiftAmt = Input(UInt(abCfg.adapter.shiftWidth.W))
-    val abGroupShift = Input(UInt(abCfg.adapter.groupShiftWidth.W))
+    val abShiftAmt = Input(UInt(abCfg.laneSwitch.shiftWidth.W))
+    val abGroupShift = Input(UInt(abCfg.laneSwitch.groupShiftWidth.W))
     // val abShiftIn = Input(Bool())
 
     val weightWriteAddr = Input(UInt(weightAddrWidth.W))
@@ -60,8 +60,8 @@ class ActivationBufferTest extends AnyFlatSpec with ChiselScalatestTester {
   def toU(v: Int, width: Int): UInt = (BigInt(v) & ((BigInt(1) << width) - 1)).U(width.W)
 
   "ActivationBuffer" should "read back a written sample after readLatency cycles (one bank per input, unicast)" in {
-    // numInputs must be a power of two here: it feeds PortAdapterConfig's
-    // numPorts, same constraint WeightBuffer's numOutputs is under
+    // numInputs is a power of two here: it is the LaneSwitch's numOut
+    // (any numOut works; groupShift then has a partial last group)
     val cuCfg = ComputeUnitConfig(numInputs = 4, numOutputs = 1, inputWidth = 8, weightWidth = 8, outputWidth = 20)
     val cfg = ActivationBufferConfig(cuCfg, numBanks = cuCfg.numInputs, wordsPerBank = 1, depth = 3,
       readLatency = 2, writeLatency = 2)
@@ -164,7 +164,7 @@ class ActivationBufferTest extends AnyFlatSpec with ChiselScalatestTester {
     }
   }
 
-  it should "broadcast a single grain to every port when groupShift = log2(numInputs)" in {
+  it should "broadcast one input lane to every output lane when groupShift = log2(numInputs)" in {
     val cuCfg = ComputeUnitConfig(numInputs = 4, numOutputs = 1, inputWidth = 8, weightWidth = 8, outputWidth = 20)
     // depth=2 (not 1): depth=1 would make sram.addrWidth = log2Ceil(1) = 0,
     // a zero-width port chiseltest can't poke -- same bug class as the
@@ -222,7 +222,7 @@ class ActivationBufferTest extends AnyFlatSpec with ChiselScalatestTester {
       c.clock.step(cfg.readLatency)
 
       c.io.operandOut.valid.expect(true.B)
-      // ports 0,1 share grain 0; ports 2,3 share grain 1
+      // output lanes 0,1 share input lane 0; 2,3 share input lane 1
       val expected = Seq(sample(0), sample(0), sample(1), sample(1))
       for (i <- sample.indices) c.io.operandOut.bits(i).expect(expected(i).U)
       c.io.readEn.poke(false.B)
@@ -232,7 +232,7 @@ class ActivationBufferTest extends AnyFlatSpec with ChiselScalatestTester {
 
   "ActivationBuffer -> SystolicArray wiring" should "produce the same matmul as poking operandIn directly" in {
     // numInputs must be a power of two here too (feeds ActivationBuffer's
-    // PortAdapter), unlike SystolicArrayTest's standalone numInputs=3
+    // LaneSwitch), unlike SystolicArrayTest's standalone numInputs=3
     val cuCfg = ComputeUnitConfig(numInputs = 4, numOutputs = 2, inputWidth = 8, weightWidth = 8, outputWidth = 20)
     val abReadLatency = 1
     test(

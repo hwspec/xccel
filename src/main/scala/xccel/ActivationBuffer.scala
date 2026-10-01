@@ -26,7 +26,7 @@ case class ActivationBufferConfig(
   // )
 
   val totalWordsPerRow: Int = numBanks * wordsPerBank
-  // val rowWidth: Int = cu.numInputs / windowDepth // per-row port count fed to PortAdapter
+  // val rowWidth: Int = cu.numInputs / windowDepth // per-row lane count fed to LaneSwitch
   val rowWidth: Int = cu.numInputs
 
   val sram: SramConfig = SramConfig(
@@ -40,11 +40,11 @@ case class ActivationBufferConfig(
     portType = portType,
   )
 
-  val adapter: PortAdapterConfig = PortAdapterConfig(
-    totalGrains = totalWordsPerRow,
-    grainWidth = cu.inputWidth,
-    numPorts = rowWidth,
-    grainsPerPort = 1,
+  val laneSwitch: LaneSwitchConfig = LaneSwitchConfig(
+    numIn = totalWordsPerRow,
+    numOut = rowWidth,
+    inPerOut = 1,
+    laneWidth = cu.inputWidth,
   )
 }
 
@@ -56,8 +56,8 @@ class ActivationBufferIO(cfg: ActivationBufferConfig) extends Bundle {
   val writeAddr = Input(UInt(cfg.sram.addrWidth.W))
   val writeEn = Input(Bool())
   val wdata = Input(Vec(cfg.totalWordsPerRow, UInt(cfg.cu.inputWidth.W)))
-  val shiftAmt = Input(UInt(cfg.adapter.shiftWidth.W))
-  val groupShift = Input(UInt(cfg.adapter.groupShiftWidth.W))
+  val shiftAmt = Input(UInt(cfg.laneSwitch.shiftWidth.W))
+  val groupShift = Input(UInt(cfg.laneSwitch.groupShiftWidth.W))
   // Line buffer disabled: im2col is done by accumulating kn2row instead (one
   // 1x1 pass per kernel position, partial sums added in Accumulator). Kept
   // commented out for reference.
@@ -95,9 +95,9 @@ class ActivationBuffer(cfg: ActivationBufferConfig) extends Module {
     (0 until cfg.wordsPerBank).map(i => wordSlice(rdata(n), i))
   })
 
-  private val shiftAmtPipe = ShiftRegister(io.shiftAmt, cfg.readLatency, 0.U(cfg.adapter.shiftWidth.W), true.B)
+  private val shiftAmtPipe = ShiftRegister(io.shiftAmt, cfg.readLatency, 0.U(cfg.laneSwitch.shiftWidth.W), true.B)
   private val groupShiftPipe =
-    ShiftRegister(io.groupShift, cfg.readLatency, 0.U(cfg.adapter.groupShiftWidth.W), true.B)
+    ShiftRegister(io.groupShift, cfg.readLatency, 0.U(cfg.laneSwitch.groupShiftWidth.W), true.B)
 
   io.operandOut.valid := ShiftRegister(io.readEn, cfg.readLatency, false.B, true.B)
 
@@ -119,6 +119,6 @@ class ActivationBuffer(cfg: ActivationBufferConfig) extends Module {
   // }
 
   // io.operandOut.bits :=
-  //   VecInit(rows.flatMap(row => PortAdapter.connect(cfg.adapter, row, shiftAmtPipe, groupShiftPipe).toSeq))
-  io.operandOut.bits := PortAdapter.connect(cfg.adapter, flatWords, shiftAmtPipe, groupShiftPipe)
+  //   VecInit(rows.flatMap(row => LaneSwitch.connect(cfg.laneSwitch, row, shiftAmtPipe, groupShiftPipe).toSeq))
+  io.operandOut.bits := LaneSwitch.connect(cfg.laneSwitch, flatWords, shiftAmtPipe, groupShiftPipe)
 }

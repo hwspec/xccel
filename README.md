@@ -12,27 +12,26 @@ It does not have any caches, reservation station, and arbiters inside the accele
 ./gwscript.py
 ```
 
-## Design Principle
+## Lane Connectivity
 
-At scheduler view, data movement is like 'move data at SRAM address i to compute-unit port j (other SRAM address j)'.
-However, the **static** connectivities at RTL-level vary.
+These four **static** connectivities between lanes (i.e., how to wire lanes between each element) are possible.
 
 - 1:1
-  - one bank, one port
+  - one input lane, one output lane
 - 1:N
-  - one wide bank feeds several ports
+  - one wide input lane feeds several output lanes
 - N:1
-  - several narrow banks feed one wide port
+  - several narrow input lanes feed one wide lane
 - N:M
-  - direct wire, but one bank/port have several wire
+  - one input/output lanes have several wire
 
-On top of this, SRAM port can take several patterns including 1RW, 1R1W, and 2RW.
+Besides, SRAM macros can take several patterns of ports including 1rw, 1r1w, and 2rw.
 
-Additionally, **dynamic** cast modes, including unicast, multicast, and broadcast, should be considered.
+For **dynamic** cast modes (i.e., how to pass data on the lane at runtime), including unicast, multicast, and broadcast, can be considered.
 This cast mode is implemented by the shifter and mux.
 
 - shiftAmt: implemented by a barrel shifter between components (e.g., interface of SRAM and systolic array mesh)
-- groupShift: how many grains (e.g., SRAM bank ports) correspond to ports (e.g., mesh ports)
+- groupShift: how many consecutive output lanes (e.g., compute-unit inputs) share one group of input lanes (e.g., words of an SRAM row)
 
 
 ## Horizontal Microcode
@@ -106,11 +105,11 @@ To realize deterministic dataflow architecture, Xccel adopts the horizontal micr
 |--------------------------------------|-------------------------------------------------------|
 | wbAddrWidth                          | log2Ceil(WeightBuffer rows)                           |
 | wbShiftWidth                         | log2Ceil(words per WeightBuffer row)                  |
-| wbGroupShiftWidth                    | log2Ceil(log2Ceil(weight ports) + 1)                  |
+| wbGroupShiftWidth                    | log2Ceil(log2Ceil(weight lanes) + 1)                  |
 | abAddrWidth                          | log2Ceil(ActivationBuffer rows)                       |
-| abShiftWidth / abGroupShiftWidth     | ActivationBuffer PortAdapter (grains = rows R)        |
+| abShiftWidth / abGroupShiftWidth     | ActivationBuffer LaneSwitch (input lanes = rows R)    |
 | accAddrWidth                         | log2Ceil(Accumulator rows)                            |
-| accShiftWidth / accGroupShiftWidth   | Accumulator PortAdapter (grains = cols C)             |
+| accShiftWidth / accGroupShiftWidth   | Accumulator LaneSwitch (input lanes = cols C)         |
 | weightPortAddrWidth                  | log2Ceil(compute unit weight beats)                   |
 | transposerIndexWidth                 | log2Ceil(C)                                           |
 | requantSetWidth                      | max(1, log2Ceil(Requantizer parameter sets))          |
@@ -119,8 +118,6 @@ To realize deterministic dataflow architecture, Xccel adopts the horizontal micr
 | beatWidth                            | max(1, log2Ceil(softmax row beats))                   |
 | residualSetWidth                     | max(1, log2Ceil(residual parameter sets))             |
 | cyclesWidth                          | log2Ceil(maxRunLength + 1)                            |
-
-## Connectivity
 
 
 ## Scheduler (tentative)

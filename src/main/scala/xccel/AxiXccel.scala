@@ -113,7 +113,7 @@ case class XccelModuleParams(
       cu,
       WeightBufferConfig(cu, numBanks = cols, wordsPerBank = wb_words_per_bank, tiles = wb_rows / rows,
         readLatency = wb_read_latency, writeLatency = wb_write_latency, portType = portType(wb_port_type),
-        weightPorts = if (compute_arrays > 1 && compute_wide_weights) compute_arrays * cols else 0),
+        weightLanes = if (compute_arrays > 1 && compute_wide_weights) compute_arrays * cols else 0),
       ActivationBufferConfig(cu, numBanks = rows, wordsPerBank = 1, depth = ab_rows,
         readLatency = ab_read_latency, writeLatency = ab_write_latency, portType = portType(ab_port_type)),
       AccumulatorConfig(cu, numBanks = cols, wordsPerBank = 1, depth = acc_rows,

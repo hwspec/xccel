@@ -22,7 +22,7 @@ case class AccumulatorConfig(
   require(
     numBanks * wordsPerBank == cu.numOutputs,
     s"numBanks*wordsPerBank (${numBanks * wordsPerBank}) must equal cu.numOutputs (${cu.numOutputs}):" +
-      " each resultIn lane maps onto exactly one grain slot, one-to-one -- the write side has no PortAdapter"
+      " each resultIn lane maps onto exactly one word of the row, one-to-one -- the write side has no LaneSwitch"
   )
 
   val totalWordsPerRow: Int = numBanks * wordsPerBank // == cu.numOutputs
@@ -49,11 +49,11 @@ case class AccumulatorConfig(
     portType = BankPortType.OneR1W,
   )
 
-  val adapter: PortAdapterConfig = PortAdapterConfig(
-    totalGrains = totalWordsPerRow,
-    grainWidth = cu.outputWidth,
-    numPorts = cu.numOutputs,
-    grainsPerPort = 1,
+  val laneSwitch: LaneSwitchConfig = LaneSwitchConfig(
+    numIn = totalWordsPerRow,
+    numOut = cu.numOutputs,
+    inPerOut = 1,
+    laneWidth = cu.outputWidth,
   )
 }
 
@@ -65,8 +65,8 @@ class AccumulatorIO(cfg: AccumulatorConfig) extends Bundle {
 
   val readAddr = Input(UInt(cfg.addrWidth.W))
   val readEn = Input(Bool())
-  val shiftAmt = Input(UInt(cfg.adapter.shiftWidth.W))
-  val groupShift = Input(UInt(cfg.adapter.groupShiftWidth.W))
+  val shiftAmt = Input(UInt(cfg.laneSwitch.shiftWidth.W))
+  val groupShift = Input(UInt(cfg.laneSwitch.groupShiftWidth.W))
   val accOut = Valid(Vec(cfg.cu.numOutputs, UInt(cfg.cu.outputWidth.W)))
 }
 
@@ -131,11 +131,11 @@ class Accumulator(cfg: AccumulatorConfig) extends Module {
     wch.wmask := fullMask
   }
 
-  private val shiftAmtPipe = ShiftRegister(io.shiftAmt, cfg.readLatency, 0.U(cfg.adapter.shiftWidth.W), true.B)
+  private val shiftAmtPipe = ShiftRegister(io.shiftAmt, cfg.readLatency, 0.U(cfg.laneSwitch.shiftWidth.W), true.B)
   private val groupShiftPipe =
-    ShiftRegister(io.groupShift, cfg.readLatency, 0.U(cfg.adapter.groupShiftWidth.W), true.B)
+    ShiftRegister(io.groupShift, cfg.readLatency, 0.U(cfg.laneSwitch.groupShiftWidth.W), true.B)
   private val drainBank = ShiftRegister(bankOf(io.readAddr), cfg.readLatency, 0.U, true.B)
 
-  io.accOut.bits := PortAdapter.connect(cfg.adapter, fromBank(drainBank), shiftAmtPipe, groupShiftPipe)
+  io.accOut.bits := LaneSwitch.connect(cfg.laneSwitch, fromBank(drainBank), shiftAmtPipe, groupShiftPipe)
   io.accOut.valid := ShiftRegister(io.readEn, cfg.readLatency, false.B, true.B)
 }

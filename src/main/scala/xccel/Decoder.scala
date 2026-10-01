@@ -117,23 +117,23 @@ class ComputeSlot extends Bundle {
 class MicroWord(cfg: DecoderConfig) extends Bundle {
   val wbRead = new ReadSlot(
     cfg.weightBuffer.sram.addrWidth,
-    cfg.weightBuffer.adapter.shiftWidth,
-    cfg.weightBuffer.adapter.groupShiftWidth,
+    cfg.weightBuffer.laneSwitch.shiftWidth,
+    cfg.weightBuffer.laneSwitch.groupShiftWidth,
   )
   val wbWrite = new WeightWriteSlot(cfg.weightBuffer.sram.addrWidth, cfg.transposerIndexWidth)
   val weightPort = new WritePortSlot(cfg.weightPortAddrWidth)
   val abWrite = new ActivationWriteSlot(cfg.activationBuffer.sram.addrWidth)
   val abRead = new ActivationReadSlot(
     cfg.activationBuffer.sram.addrWidth,
-    cfg.activationBuffer.adapter.shiftWidth,
-    cfg.activationBuffer.adapter.groupShiftWidth,
+    cfg.activationBuffer.laneSwitch.shiftWidth,
+    cfg.activationBuffer.laneSwitch.groupShiftWidth,
   )
   val compute = new ComputeSlot
   val accWrite = new AccWriteSlot(cfg.accumulator.addrWidth)
   val accRead = new ReadSlot(
     cfg.accumulator.addrWidth,
-    cfg.accumulator.adapter.shiftWidth,
-    cfg.accumulator.adapter.groupShiftWidth,
+    cfg.accumulator.laneSwitch.shiftWidth,
+    cfg.accumulator.laneSwitch.groupShiftWidth,
   )
   val requant = new RequantSlot(cfg.requantSetWidth)
   val transposer = new TransposerSlot(cfg.transposerIndexWidth)
@@ -232,16 +232,16 @@ class DecoderIO(cfg: DecoderConfig) extends Bundle {
 
   val wbRead = Output(new ReadCtrl(
     cfg.weightBuffer.sram.addrWidth,
-    cfg.weightBuffer.adapter.shiftWidth,
-    cfg.weightBuffer.adapter.groupShiftWidth,
+    cfg.weightBuffer.laneSwitch.shiftWidth,
+    cfg.weightBuffer.laneSwitch.groupShiftWidth,
   ))
   val wbWrite = Output(new WeightWriteCtrl(cfg.weightBuffer.sram.addrWidth, cfg.transposerIndexWidth))
   val weightPort = Output(new WritePortCtrl(cfg.weightPortAddrWidth))
   val abWrite = Output(new ActivationWriteCtrl(cfg.activationBuffer.sram.addrWidth))
   val abRead = Output(new ActivationReadCtrl(
     cfg.activationBuffer.sram.addrWidth,
-    cfg.activationBuffer.adapter.shiftWidth,
-    cfg.activationBuffer.adapter.groupShiftWidth,
+    cfg.activationBuffer.laneSwitch.shiftWidth,
+    cfg.activationBuffer.laneSwitch.groupShiftWidth,
   ))
   val weightSelect = Output(Bool())
   val requantParamSet = Output(UInt(cfg.requantSetWidth.W))
@@ -251,8 +251,8 @@ class DecoderIO(cfg: DecoderConfig) extends Bundle {
   val accWrite = Output(new AccWriteCtrl(cfg.accumulator.addrWidth))
   val accRead = Output(new ReadCtrl(
     cfg.accumulator.addrWidth,
-    cfg.accumulator.adapter.shiftWidth,
-    cfg.accumulator.adapter.groupShiftWidth,
+    cfg.accumulator.laneSwitch.shiftWidth,
+    cfg.accumulator.laneSwitch.groupShiftWidth,
   ))
 }
 
