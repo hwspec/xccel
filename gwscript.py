@@ -23,7 +23,7 @@ def load_config():
         raise RuntimeError(
             f"Missing config file: {CONFIG_FILE}\n"
             "Please create .gwconfig with:\n"
-            "name=AxiXccelOpt9x64T\n"
+            "name=AxiXccel\n"
             "package=xccel\n"
             "tests=braggnn_inference_opt\n"
             "fpgatest=false"
@@ -56,9 +56,12 @@ TESTS = [
     if item.strip()
 ]
 
-AVED = ROOT / f"v80-aved-platform-{PACKAGE}"
+AVED_REPO = CONFIG.get("aved_repo", "https://github.com/hwspec/AVED-gw.git")
+AVED = ROOT / "AVED-gw"
 AVED_HW = AVED / "hw/amd_v80_gen5x8_25.1"
-USER_ACCEL = AVED_HW / "src/rtl/user_accel"
+GW_RTL = AVED_HW / "src/rtl/garageworks"   # AVED-gw expects top module `wrapper`
+BDF = CONFIG.get("bdf", "b1:00.0")
+AMI_TOOL = CONFIG.get("ami_tool", "/usr/local/bin/ami_tool")
 GENERATED = ROOT / "generated" / NAME
 VENV = ROOT / "garageworks/.venv"
 
@@ -356,7 +359,7 @@ def bridge():
 
 
 def rtlgen():
-    run(["./mill", "runMain", f"{PACKAGE}.{NAME}"])
+    run(["sbt", f"runMain {PACKAGE}.{NAME}"])
 
     if not GENERATED.is_dir():
         raise RuntimeError(
@@ -375,7 +378,7 @@ def cocotb():
 
     for testname in TESTS:
         print(f"\nRunning cocotb test target: {testname}")
-        run(["make", "-C", "tests", testname, f"HWMODULENAME={NAME}"], env=env)
+        run(["make", "-C", "tests", testname], env=env)
 
     return {
         "tests_dir": str(ROOT / "tests"),
@@ -570,12 +573,7 @@ def aved():
             )
         print(f"AVED repository already exists: {AVED}")
     else:
-        run([
-            "git",
-            "clone",
-            "https://github.com/hwspec/v80-aved-platform-.git",
-            str(AVED),
-        ])
+        run(["git", "clone", AVED_REPO, str(AVED)])
 
         if not (AVED / ".git").is_dir():
             raise RuntimeError("AVED clone did not complete successfully")
@@ -583,14 +581,25 @@ def aved():
     os.environ["AVED"] = str(AVED)
     print(f"AVED={AVED}")
 
-    run(["make", "-C", "sw/AMI/api"], cwd=AVED)
-    run(["make", "-C", "sw/runtime"], cwd=AVED)
+    # builds libami.so + libvamp.so/pyaved.py (sw/vamp/build)
+    run(["make", "sw"], cwd=AVED)
 
     return {"aved_dir": str(AVED)}
 
 
+def _paramfn():
+    """params.json if present, else the single generated *.json."""
+    p = GW_RTL / "params.json"
+    if p.is_file():
+        return p
+    jsons = sorted(GW_RTL.glob("*.json"))
+    if len(jsons) != 1:
+        raise RuntimeError(f"Cannot pick params JSON in {GW_RTL}: {jsons}")
+    return jsons[0]
+
+
 def useracc():
-    USER_ACCEL.mkdir(parents=True, exist_ok=True)
+    GW_RTL.mkdir(parents=True, exist_ok=True)
 
     files = []
     for pattern in ("*.v", "*.sv", "*.json"):
@@ -599,15 +608,37 @@ def useracc():
     if not files:
         raise RuntimeError(f"No generated RTL/JSON files found in {GENERATED}")
 
+    # remove previous design so stale RTL/JSON never leaks into the build
+    for pattern in ("*.v", "*.sv", "*.json"):
+        for old in GW_RTL.glob(pattern):
+            old.unlink()
+
     copied = []
 
     for src in files:
-        dst = USER_ACCEL / src.name
+        dst = GW_RTL / src.name
         print(f"copy {src} -> {dst}")
         shutil.copy2(src, dst)
         copied.append(str(dst))
 
-    return {"copied": copied}
+    # GarageWorks emits user_accel_bd_wrapper.v; AVED-gw's BD references `wrapper`
+    gw_wrapper = GW_RTL / "user_accel_bd_wrapper.v"
+    wrapper = GW_RTL / "wrapper.v"
+    if gw_wrapper.is_file():
+        text = gw_wrapper.read_text()
+        text, n = re.subn(r"^module\s+user_accel_bd_wrapper\b", "module wrapper",
+                          text, count=1, flags=re.MULTILINE)
+        if n != 1:
+            raise RuntimeError(f"Could not rename module in {gw_wrapper}")
+        wrapper.write_text(text)
+        gw_wrapper.unlink()
+        copied = [c for c in copied if c != str(gw_wrapper)] + [str(wrapper)]
+        print(f"rename {gw_wrapper.name} -> {wrapper.name} (module wrapper)")
+
+    if not wrapper.is_file():
+        raise RuntimeError(f"Missing {wrapper} (top module must be `wrapper`)")
+
+    return {"copied": copied, "paramfn": str(_paramfn())}
 
 
 def firmware():
@@ -646,6 +677,17 @@ def firmware():
     return {"log": str(log_path)}
 
 
+def _device_present():
+    r = subprocess.run(["lspci", "-s", BDF], text=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    return bool(r.stdout.strip())
+
+
+def _pci_rescan():
+    run(["sudo", "sh", "-c", "echo 1 > /sys/bus/pci/rescan"])
+    time.sleep(2)
+
+
 def program():
     prog_result = run(
         ["make", "prog"],
@@ -653,17 +695,27 @@ def program():
         ignore_returncode=True,
     )
 
-    run([
-        "sudo",
-        "/usr/local/bin/ami_tool",
-        "reload",
-        "-t", "sbr",
-        "-d", "b1:00.0",
-    ])
+    # JTAG programming drops the PCIe link; the kernel may remove the device
+    if not _device_present():
+        _pci_rescan()
+
+    if _device_present():
+        # sbr removes the device itself and rescans; re-check afterwards
+        run(["sudo", AMI_TOOL, "reload", "-t", "sbr", "-d", BDF],
+            ignore_returncode=True)
+        time.sleep(2)
+
+    if not _device_present():
+        _pci_rescan()
+
+    if not _device_present():
+        raise RuntimeError(f"{BDF} not on PCIe after programming; power cycle may be needed")
+
+    run([AMI_TOOL, "overview"], ignore_returncode=True)
 
     return {
         "make_prog_returncode": prog_result.returncode,
-        "ami_reload": "success",
+        "bdf": BDF,
     }
 
 
@@ -671,21 +723,20 @@ def fpgatest(testname=None):
     env = venv_env()
     env["AVED"] = str(AVED)
 
+    vamp_build = AVED / "sw/vamp/build"   # libvamp.so + pyaved.py
+    ami_build = AVED / "sw/AMI/api/build"  # libami.so
+
     old_pythonpath = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = (
-        f"{old_pythonpath}:{AVED}/sw/runtime/src"
-        if old_pythonpath
-        else f"{AVED}/sw/runtime/src"
+        f"{old_pythonpath}:{vamp_build}" if old_pythonpath else str(vamp_build)
     )
 
-    env["LD_LIBRARY_PATH"] = (
-        f"{AVED}/sw/runtime/build:"
-        f"{AVED}/sw/AMI/api/build/"
+    old_ldpath = env.get("LD_LIBRARY_PATH", "")
+    env["LD_LIBRARY_PATH"] = f"{vamp_build}:{ami_build}" + (
+        f":{old_ldpath}" if old_ldpath else ""
     )
 
-    env["PARAMFN"] = str(
-        AVED_HW / "src/rtl/user_accel/params.json"
-    )
+    env["PARAMFN"] = str(_paramfn())
 
     targets = [testname] if testname else TESTS
     if not targets:
