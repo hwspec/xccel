@@ -5,6 +5,7 @@
 SIM ?= verilator
 TOPLEVEL_LANG ?= verilog
 TOPNAME=user_accel_bd_wrapper
+#HWMODULENAME=AxiXccelOpt9x64T
 HWMODULENAME=AxiXccel
 SRCDIR = $(abspath ../generated/$(HWMODULENAME))
 VERILOG_SOURCES += $(SRCDIR)/*.v $(SRCDIR)/*.sv
@@ -34,7 +35,7 @@ $(TARGETS) : $(SRCDIR)/$(HWMODULENAME).sv
 # and on a 3 x 3 window of arrays with wide weight beats:
 #   make braggnn_inference_opt HWMODULENAME=AxiXccelOpt9 SIM_BUILD=sim_build_opt9
 $(SRCDIR)/$(HWMODULENAME).sv gen:
-	(cd ../ ; ./mill runMain xccel.$(HWMODULENAME))
+	(cd ../ ; sbt runMain xccel.$(HWMODULENAME))
 
 include $(shell cocotb-config --makefiles)/Makefile.sim
 
