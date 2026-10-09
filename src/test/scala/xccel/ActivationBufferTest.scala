@@ -21,8 +21,8 @@ class ActivationBufferSystolicHarness(
     val abEn = Input(Bool())
     val abWen = Input(Bool())
     val abWdata = Input(Vec(abCfg.totalWordsPerRow, UInt(cuCfg.inputWidth.W)))
-    val abShiftAmt = Input(UInt(abCfg.laneSwitch.shiftWidth.W))
-    val abGroupShift = Input(UInt(abCfg.laneSwitch.groupShiftWidth.W))
+    val abRotate = Input(UInt(abCfg.laneSwitch.rotateWidth.W))
+    val abFanout = Input(UInt(abCfg.laneSwitch.fanoutWidth.W))
     // val abShiftIn = Input(Bool())
 
     val weightWriteAddr = Input(UInt(weightAddrWidth.W))
@@ -41,8 +41,8 @@ class ActivationBufferSystolicHarness(
   activationBuffer.io.writeAddr := io.abAddr
   activationBuffer.io.writeEn := io.abEn && io.abWen
   activationBuffer.io.wdata := io.abWdata
-  activationBuffer.io.shiftAmt := io.abShiftAmt
-  activationBuffer.io.groupShift := io.abGroupShift
+  activationBuffer.io.rotate := io.abRotate
+  activationBuffer.io.fanout := io.abFanout
   // activationBuffer.io.shiftIn := io.abShiftIn
 
   compute.weightWriteAddr := io.weightWriteAddr
@@ -61,14 +61,14 @@ class ActivationBufferTest extends AnyFlatSpec with ChiselScalatestTester {
 
   "ActivationBuffer" should "read back a written sample after readLatency cycles (one bank per input, unicast)" in {
     // numInputs is a power of two here: it is the LaneSwitch's numOut
-    // (any numOut works; groupShift then has a partial last group)
+    // (any numOut works; fanout then has a partial last group)
     val cuCfg = ComputeUnitConfig(numInputs = 4, numOutputs = 1, inputWidth = 8, weightWidth = 8, outputWidth = 20)
     val cfg = ActivationBufferConfig(cuCfg, numBanks = cuCfg.numInputs, wordsPerBank = 1, depth = 3,
       readLatency = 2, writeLatency = 2)
     test(new ActivationBuffer(cfg)) { c =>
       val samples = Seq(Seq(11, 12, 13, 14), Seq(21, 22, 23, 24), Seq(31, 32, 33, 34))
-      c.io.shiftAmt.poke(0.U)
-      c.io.groupShift.poke(0.U) // unicast
+      c.io.rotate.poke(0.U)
+      c.io.fanout.poke(0.U) // unicast
       // c.io.shiftIn.poke(true.B)
 
       for ((s, r) <- samples.zipWithIndex) {
@@ -99,8 +99,8 @@ class ActivationBufferTest extends AnyFlatSpec with ChiselScalatestTester {
       readLatency = 2, writeLatency = 2)
     test(new ActivationBuffer(cfg)) { c =>
       val samples = Seq(Seq(1, 2, 3, 4), Seq(5, 6, 7, 8), Seq(9, 10, 11, 12))
-      c.io.shiftAmt.poke(0.U)
-      c.io.groupShift.poke(0.U) // unicast
+      c.io.rotate.poke(0.U)
+      c.io.fanout.poke(0.U) // unicast
       // c.io.shiftIn.poke(true.B)
 
       for ((s, r) <- samples.zipWithIndex) {
@@ -125,7 +125,7 @@ class ActivationBufferTest extends AnyFlatSpec with ChiselScalatestTester {
     }
   }
 
-  it should "select the right window via shiftAmt (several banks, several sample groups packed side by side, unicast)" in {
+  it should "select the right window via rotate (several banks, several sample groups packed side by side, unicast)" in {
     val cuCfg = ComputeUnitConfig(numInputs = 2, numOutputs = 1, inputWidth = 8, weightWidth = 8, outputWidth = 20)
     // 3 independent sample streams packed side by side across the bank
     // dimension at the same addresses: A at banks [0,1], B at [2,3], C at [4,5]
@@ -135,7 +135,7 @@ class ActivationBufferTest extends AnyFlatSpec with ChiselScalatestTester {
       val groupA = Seq(Seq(1, 2), Seq(3, 4), Seq(5, 6))
       val groupB = Seq(Seq(10, 20), Seq(30, 40), Seq(50, 60))
       val groupC = Seq(Seq(100, 101), Seq(102, 103), Seq(104, 105))
-      c.io.groupShift.poke(0.U) // unicast
+      c.io.fanout.poke(0.U) // unicast
       // c.io.shiftIn.poke(true.B)
 
       for (r <- 0 until cfg.depth) {
@@ -153,7 +153,7 @@ class ActivationBufferTest extends AnyFlatSpec with ChiselScalatestTester {
         for ((s, r) <- group.zipWithIndex) {
           c.io.readAddr.poke(r.U)
           c.io.readEn.poke(true.B)
-          c.io.shiftAmt.poke(shamt.U)
+          c.io.rotate.poke(shamt.U)
           c.clock.step(cfg.readLatency)
           c.io.operandOut.valid.expect(true.B)
           for ((v, i) <- s.zipWithIndex) c.io.operandOut.bits(i).expect(v.U)
@@ -164,7 +164,7 @@ class ActivationBufferTest extends AnyFlatSpec with ChiselScalatestTester {
     }
   }
 
-  it should "broadcast one input lane to every output lane when groupShift = log2(numInputs)" in {
+  it should "broadcast one input lane to every output lane when fanout = log2(numInputs)" in {
     val cuCfg = ComputeUnitConfig(numInputs = 4, numOutputs = 1, inputWidth = 8, weightWidth = 8, outputWidth = 20)
     // depth=2 (not 1): depth=1 would make sram.addrWidth = log2Ceil(1) = 0,
     // a zero-width port chiseltest can't poke -- same bug class as the
@@ -185,10 +185,10 @@ class ActivationBufferTest extends AnyFlatSpec with ChiselScalatestTester {
 
       c.io.readAddr.poke(0.U)
       c.io.readEn.poke(true.B)
-      c.io.groupShift.poke(2.U) // log2(4) = broadcast
+      c.io.fanout.poke(2.U) // log2(4) = broadcast
 
       for (shamt <- sample.indices) {
-        c.io.shiftAmt.poke(shamt.U)
+        c.io.rotate.poke(shamt.U)
         c.clock.step(cfg.readLatency)
         c.io.operandOut.valid.expect(true.B)
         for (i <- sample.indices) c.io.operandOut.bits(i).expect(sample(shamt).U)
@@ -198,7 +198,7 @@ class ActivationBufferTest extends AnyFlatSpec with ChiselScalatestTester {
     }
   }
 
-  it should "multicast in groups of 2 when groupShift = 1 (between unicast and broadcast)" in {
+  it should "multicast in groups of 2 when fanout = 1 (between unicast and broadcast)" in {
     val cuCfg = ComputeUnitConfig(numInputs = 4, numOutputs = 1, inputWidth = 8, weightWidth = 8, outputWidth = 20)
     // depth=2, not 1 -- see the broadcast test above for why
     val cfg = ActivationBufferConfig(cuCfg, numBanks = 4, wordsPerBank = 1, depth = 2,
@@ -217,8 +217,8 @@ class ActivationBufferTest extends AnyFlatSpec with ChiselScalatestTester {
 
       c.io.readAddr.poke(0.U)
       c.io.readEn.poke(true.B)
-      c.io.shiftAmt.poke(0.U)
-      c.io.groupShift.poke(1.U) // groupSize = 2
+      c.io.rotate.poke(0.U)
+      c.io.fanout.poke(1.U) // groupSize = 2
       c.clock.step(cfg.readLatency)
 
       c.io.operandOut.valid.expect(true.B)
@@ -272,8 +272,8 @@ class ActivationBufferTest extends AnyFlatSpec with ChiselScalatestTester {
       c.io.abWen.poke(false.B)
       c.clock.step(1) // abWriteLatency
 
-      c.io.abShiftAmt.poke(0.U)
-      c.io.abGroupShift.poke(0.U) // unicast
+      c.io.abRotate.poke(0.U)
+      c.io.abFanout.poke(0.U) // unicast
       // c.io.abShiftIn.poke(true.B)
 
       for (r <- samples.indices) {
@@ -308,8 +308,8 @@ class ActivationBufferTest extends AnyFlatSpec with ChiselScalatestTester {
   //     readLatency = 2, writeLatency = 2, windowDepth = 3)
   //   test(new ActivationBuffer(cfg)) { c =>
   //     val rows = Seq(Seq(1, 2), Seq(3, 4), Seq(5, 6), Seq(7, 8), Seq(9, 10))
-  //     c.io.shiftAmt.poke(0.U)
-  //     c.io.groupShift.poke(0.U) // unicast
+  //     c.io.rotate.poke(0.U)
+  //     c.io.fanout.poke(0.U) // unicast
   //     c.io.shiftIn.poke(true.B) // ADVANCE: every read is a new row
 //
   //     for ((row, r) <- rows.zipWithIndex) {
@@ -356,7 +356,7 @@ class ActivationBufferTest extends AnyFlatSpec with ChiselScalatestTester {
   //   }
   // }
 //
-  // it should "let shiftIn=false re-select a different shiftAmt window without disturbing history (RESELECT)" in {
+  // it should "let shiftIn=false re-select a different rotate window without disturbing history (RESELECT)" in {
   //   val cuCfg = ComputeUnitConfig(numInputs = 4, numOutputs = 1, inputWidth = 8, weightWidth = 8, outputWidth = 20)
   //   val cfg = ActivationBufferConfig(cuCfg, numBanks = 4, wordsPerBank = 1, depth = 3,
   //     readLatency = 2, writeLatency = 2, windowDepth = 2)
@@ -375,12 +375,12 @@ class ActivationBufferTest extends AnyFlatSpec with ChiselScalatestTester {
   //     c.io.wen.poke(false.B)
   //     c.clock.step(cfg.writeLatency)
 //
-  //     def issueRead(addr: Int, shiftAmt: Int, shiftIn: Boolean): Unit = {
+  //     def issueRead(addr: Int, rotate: Int, shiftIn: Boolean): Unit = {
   //       c.io.addr.poke(addr.U)
   //       c.io.en.poke(true.B)
   //       c.io.wen.poke(false.B)
-  //       c.io.shiftAmt.poke(shiftAmt.U)
-  //       c.io.groupShift.poke(0.U)
+  //       c.io.rotate.poke(rotate.U)
+  //       c.io.fanout.poke(0.U)
   //       c.io.shiftIn.poke(shiftIn.B)
   //       c.clock.step()
   //       c.io.en.poke(false.B)
@@ -388,17 +388,17 @@ class ActivationBufferTest extends AnyFlatSpec with ChiselScalatestTester {
   //     }
 //
   //     // ADVANCE: load row0 (warm-up, not checked)
-  //     issueRead(0, shiftAmt = 0, shiftIn = true)
+  //     issueRead(0, rotate = 0, shiftIn = true)
 //
-  //     // two reads at the SAME address (row1), sweeping shiftAmt. The
+  //     // two reads at the SAME address (row1), sweeping rotate. The
   //     // first is RESELECT (shiftIn=false): history must stay [row0] so
   //     // both reads see the same window [row0, row1], just different
   //     // columns. The second (last of the group) commits the shift.
-  //     issueRead(1, shiftAmt = 0, shiftIn = false)
+  //     issueRead(1, rotate = 0, shiftIn = false)
   //     c.io.operandOut.valid.expect(true.B)
   //     Seq(1, 2, 10, 20).zipWithIndex.foreach { case (v, i) => c.io.operandOut.bits(i).expect(v.U) }
 //
-  //     issueRead(1, shiftAmt = 2, shiftIn = true)
+  //     issueRead(1, rotate = 2, shiftIn = true)
   //     c.io.operandOut.valid.expect(true.B)
   //     Seq(3, 4, 30, 40).zipWithIndex.foreach { case (v, i) => c.io.operandOut.bits(i).expect(v.U) }
   //   }

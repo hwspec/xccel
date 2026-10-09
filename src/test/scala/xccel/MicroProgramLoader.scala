@@ -36,7 +36,7 @@ object MicroProgramLoader {
 
 // One cycle of resolved control, for building a program as a per-cycle
 // table (what each element does in each cycle) and letting
-// CycleProgram.compress fold it into MicroWords. shiftAmt/groupShift and
+// CycleProgram.compress fold it into MicroWords. rotate/fanout and
 // the accRead slot are left at zero.
 case class CycleControl(
   wbEn: Boolean = false,

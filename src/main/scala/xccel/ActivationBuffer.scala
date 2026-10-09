@@ -60,14 +60,14 @@ class ActivationBufferIO(cfg: ActivationBufferConfig) extends Bundle {
   val writeAddr = Input(UInt(cfg.sram.addrWidth.W))
   val writeEn = Input(Bool())
   val wdata = Input(Vec(cfg.totalWordsPerRow, UInt(cfg.cu.inputWidth.W)))
-  val shiftAmt = Input(UInt(cfg.laneSwitch.shiftWidth.W))
+  val rotate = Input(UInt(cfg.laneSwitch.rotateWidth.W))
   val fanout = Input(UInt(cfg.laneSwitch.fanoutWidth.W))
   // Line buffer disabled: im2col is done by accumulating kn2row instead (one
   // 1x1 pass per kernel position, partial sums added in Accumulator). Kept
   // commented out for reference.
   // // windowDepth>1 only: true = this row is new, shift it into the line
   // // buffer's history; false = re-select within the currently resident
-  // // rows (e.g. a different shiftAmt column) without disturbing history.
+  // // rows (e.g. a different rotate column) without disturbing history.
   // // Ignored when windowDepth=1 (no history exists to shift).
   // val shiftIn = Input(Bool())
 
@@ -99,7 +99,7 @@ class ActivationBuffer(cfg: ActivationBufferConfig) extends Module {
     (0 until cfg.wordsPerBank).map(i => wordSlice(rdata(n), i))
   })
 
-  private val shiftAmtPipe = ShiftRegister(io.shiftAmt, cfg.readLatency, 0.U(cfg.laneSwitch.shiftWidth.W), true.B)
+  private val rotatePipe = ShiftRegister(io.rotate, cfg.readLatency, 0.U(cfg.laneSwitch.rotateWidth.W), true.B)
   private val fanoutPipe =
     ShiftRegister(io.fanout, cfg.readLatency, 0.U(cfg.laneSwitch.fanoutWidth.W), true.B)
 
@@ -123,6 +123,6 @@ class ActivationBuffer(cfg: ActivationBufferConfig) extends Module {
   // }
 
   // io.operandOut.bits :=
-  //   VecInit(rows.flatMap(row => LaneSwitch.connect(cfg.laneSwitch, row, shiftAmtPipe, fanoutPipe).toSeq))
-  io.operandOut.bits := LaneSwitch.connect(cfg.laneSwitch, flatWords, shiftAmtPipe, fanoutPipe)
+  //   VecInit(rows.flatMap(row => LaneSwitch.connect(cfg.laneSwitch, row, rotatePipe, fanoutPipe).toSeq))
+  io.operandOut.bits := LaneSwitch.connect(cfg.laneSwitch, flatWords, rotatePipe, fanoutPipe)
 }

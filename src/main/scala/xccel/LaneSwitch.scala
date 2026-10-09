@@ -9,7 +9,7 @@ import chisel3.util._
 //   - inPerOut (structural, compile-time): an output lane concatenates
 //     inPerOut adjacent input lanes (outWidth = inPerOut * laneWidth).
 //     1 = the 1:1 / 1:N shapes; > 1 = the N:1 shape.
-//   - shiftAmt (dynamic, decoder-driven): rotates the input lanes before
+//   - rotate (dynamic, decoder-driven): rotates the input lanes before
 //     assignment, so the active window can start anywhere -- e.g.
 //     selecting which resident tile is active.
 //   - fanout (dynamic, decoder-driven): log2 of how many consecutive
@@ -39,7 +39,7 @@ case class LaneSwitchConfig(
   )
 
   val outWidth: Int = inPerOut * laneWidth
-  val shiftWidth: Int = log2Ceil(numIn)
+  val rotateWidth: Int = log2Ceil(numIn)
   // the largest fanout built (maxFanout resolved)
   val fanoutLimit: Int = maxFanout.getOrElse(log2Ceil(numOut))
   require(
@@ -51,8 +51,8 @@ case class LaneSwitchConfig(
 }
 
 object LaneSwitch {
-  def connect(cfg: LaneSwitchConfig, in: Vec[UInt], shiftAmt: UInt, fanout: UInt): Vec[UInt] = {
-    val rotated = BarrelShifter.rotateLeft(in, shiftAmt)
+  def connect(cfg: LaneSwitchConfig, in: Vec[UInt], rotate: UInt, fanout: UInt): Vec[UInt] = {
+    val rotated = BarrelShifter.rotateLeft(in, rotate)
     // output lane j takes group j >> fanout. fanout only ranges over
     // 0..maxFanout (any larger value acts as maxFanout), so each output lane
     // selects among those few static groups instead of indexing every input

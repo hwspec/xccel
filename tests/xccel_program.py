@@ -9,7 +9,7 @@ cycles. This mirrors CycleProgram.compress in the Scala tests.
 """
 
 # strided field -> its stride field (every other field must stay constant within a word)
-STRIDES = {"addr": "addrStride", "shiftAmt": "shiftStride", "column": "columnStride", "row": "rowStride"}
+STRIDES = {"addr": "addrStride", "rotate": "rotateStride", "column": "columnStride", "row": "rowStride"}
 
 
 def _stride_of(path):

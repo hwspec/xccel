@@ -24,8 +24,8 @@ class AccumulatorTest extends AnyFlatSpec with ChiselScalatestTester {
 
       c.io.readAddr.poke(0.U)
       c.io.readEn.poke(true.B)
-      c.io.shiftAmt.poke(0.U)
-      c.io.groupShift.poke(0.U) // unicast
+      c.io.rotate.poke(0.U)
+      c.io.fanout.poke(0.U) // unicast
       c.clock.step(cfg.readLatency)
 
       c.io.accOut.valid.expect(true.B)
@@ -55,8 +55,8 @@ class AccumulatorTest extends AnyFlatSpec with ChiselScalatestTester {
       // data, unaffected by the concurrent write to a different address
       c.io.readAddr.poke(0.U)
       c.io.readEn.poke(true.B)
-      c.io.shiftAmt.poke(0.U)
-      c.io.groupShift.poke(0.U)
+      c.io.rotate.poke(0.U)
+      c.io.fanout.poke(0.U)
 
       c.io.resultIn.valid.poke(true.B)
       c.io.writeAddr.poke(1.U)
@@ -88,8 +88,8 @@ class AccumulatorTest extends AnyFlatSpec with ChiselScalatestTester {
     val cfg = AccumulatorConfig(cuCfg, numBanks = 2, wordsPerBank = 1, depth = 4, readLatency = 2, writeLatency = 2)
     test(new Accumulator(cfg)) { c =>
       c.io.readEn.poke(false.B)
-      c.io.shiftAmt.poke(0.U)
-      c.io.groupShift.poke(0.U)
+      c.io.rotate.poke(0.U)
+      c.io.fanout.poke(0.U)
 
       // one beat per cycle to rows 0..2, each pass on consecutive cycles
       def pass(values: Seq[Seq[Int]], accumulate: Boolean): Unit = {
@@ -128,8 +128,8 @@ class AccumulatorTest extends AnyFlatSpec with ChiselScalatestTester {
     val cfg = AccumulatorConfig(cuCfg, numBanks = 2, wordsPerBank = 1, depth = 8, readLatency = 2, writeLatency = 2,
       rowBanks = 2) // rows 0..3 in bank 0, rows 4..7 in bank 1
     test(new Accumulator(cfg)) { c =>
-      c.io.shiftAmt.poke(0.U)
-      c.io.groupShift.poke(0.U)
+      c.io.rotate.poke(0.U)
+      c.io.fanout.poke(0.U)
       c.io.readEn.poke(false.B)
       def beat(row: Int, v: Seq[Int], acc: Boolean): Unit = {
         c.io.resultIn.valid.poke(true.B)

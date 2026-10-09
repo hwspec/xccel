@@ -53,7 +53,7 @@ class WeightBufferIO(cfg: WeightBufferConfig) extends Bundle {
   val writeAddr = Input(UInt(cfg.sram.addrWidth.W))
   val writeEn = Input(Bool())
   val wdata = Input(Vec(cfg.totalWordsPerRow, UInt(cfg.cu.weightWidth.W)))
-  val shiftAmt = Input(UInt(cfg.laneSwitch.shiftWidth.W))
+  val rotate = Input(UInt(cfg.laneSwitch.rotateWidth.W))
   val fanout = Input(UInt(cfg.laneSwitch.fanoutWidth.W))
 
   // one weight beat of the compute unit (HasStationaryWeights.weightWriteData)
@@ -84,10 +84,10 @@ class WeightBuffer(cfg: WeightBufferConfig) extends Module {
     (0 until cfg.wordsPerBank).map(i => wordSlice(rdata(n), i))
   })
 
-  private val shiftAmtPipe = ShiftRegister(io.shiftAmt, cfg.readLatency, 0.U(cfg.laneSwitch.shiftWidth.W), true.B)
+  private val rotatePipe = ShiftRegister(io.rotate, cfg.readLatency, 0.U(cfg.laneSwitch.rotateWidth.W), true.B)
   private val fanoutPipe =
     ShiftRegister(io.fanout, cfg.readLatency, 0.U(cfg.laneSwitch.fanoutWidth.W), true.B)
 
-  io.weightOut.bits := LaneSwitch.connect(cfg.laneSwitch, flatWords, shiftAmtPipe, fanoutPipe)
+  io.weightOut.bits := LaneSwitch.connect(cfg.laneSwitch, flatWords, rotatePipe, fanoutPipe)
   io.weightOut.valid := ShiftRegister(io.readEn, cfg.readLatency, false.B, true.B)
 }

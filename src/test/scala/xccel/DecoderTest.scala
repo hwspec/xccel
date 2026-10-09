@@ -52,12 +52,12 @@ class DecoderTest extends AnyFlatSpec with ChiselScalatestTester {
           w.abWrite.addrStride.poke(2.U)
           w.abWrite.fromRequantizer.poke(true.B)
         }
-        // w1: ActivationBuffer sweeping shiftAmt 0,1 at a fixed addr, in
+        // w1: ActivationBuffer sweeping rotate 0,1 at a fixed addr, in
         // parallel with the weight port writing slot 1, addr 0,1
         p.word(cycles = 2) { w =>
           w.abRead.en.poke(true.B)
           w.abRead.addr.poke(5.U)
-          w.abRead.shiftStride.poke(1.U)
+          w.abRead.rotateStride.poke(1.U)
           w.weightPort.en.poke(true.B)
           w.weightPort.addrStride.poke(1.U)
           w.weightPort.slot.poke(true.B)
@@ -66,16 +66,16 @@ class DecoderTest extends AnyFlatSpec with ChiselScalatestTester {
         p.word(cycles = 1) { w =>
           w.abRead.en.poke(true.B)
           w.abRead.addr.poke(5.U)
-          w.abRead.shiftAmt.poke(2.U)
+          w.abRead.rotate.poke(2.U)
           w.compute.weightSelect.poke(true.B)
         }
-        // w3: Accumulator drain counting down (addr 3,2) with groupShift=1,
+        // w3: Accumulator drain counting down (addr 3,2) with fanout=1,
         // accumulating writes counting up (1,2)
         p.word(cycles = 2) { w =>
           w.accRead.en.poke(true.B)
           w.accRead.addr.poke(3.U)
           w.accRead.addrStride.poke(MicroProgramLoader.minusOne(accCfg.addrWidth))
-          w.accRead.groupShift.poke(1.U)
+          w.accRead.fanout.poke(1.U)
           w.accWrite.addr.poke(1.U)
           w.accWrite.addrStride.poke(1.U)
           w.accWrite.accumulate.poke(true.B)
@@ -117,7 +117,7 @@ class DecoderTest extends AnyFlatSpec with ChiselScalatestTester {
           c.io.wbRead.en.expect(false.B)
           c.io.abRead.en.expect(true.B)
           c.io.abRead.addr.expect(5.U)
-          c.io.abRead.shiftAmt.expect(s.U)
+          c.io.abRead.rotate.expect(s.U)
           c.io.weightPort.en.expect(true.B)
           c.io.weightPort.addr.expect(s.U)
           c.io.weightPort.slot.expect(true.B)
@@ -128,7 +128,7 @@ class DecoderTest extends AnyFlatSpec with ChiselScalatestTester {
         // t4: w2
         c.io.abRead.en.expect(true.B)
         c.io.abRead.addr.expect(5.U)
-        c.io.abRead.shiftAmt.expect(2.U)
+        c.io.abRead.rotate.expect(2.U)
         c.io.weightSelect.expect(true.B)
         c.io.weightPort.en.expect(false.B)
         c.clock.step()
@@ -138,7 +138,7 @@ class DecoderTest extends AnyFlatSpec with ChiselScalatestTester {
           c.io.abRead.en.expect(false.B)
           c.io.accRead.en.expect(true.B)
           c.io.accRead.addr.expect(r.U)
-          c.io.accRead.groupShift.expect(1.U)
+          c.io.accRead.fanout.expect(1.U)
           c.io.accWrite.addr.expect(wr.U)
           c.io.accWrite.accumulate.expect(true.B)
           c.io.weightSelect.expect(false.B)

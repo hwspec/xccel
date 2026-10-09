@@ -22,7 +22,7 @@ undelayed array only. With one array row per weight beat the scheduler keeps,
 per weight slot, which rows of the other arrays may hold nonzero weights and
 zeroes those a pass's operand lanes would meet (from one all-zero
 WeightBuffer row); with wide beats a 1x1 row is stored zero-padded in the
-first C words of a WeightBuffer row and rotated (wbRead.shiftAmt) onto the
+first C words of a WeightBuffer row and rotated (wbRead.rotate) onto the
 last array, which zeroes the others' row in the same load. It keeps the
 cycles within the arrays' longest delay before such a pass free of kernel
 beats, whose products would otherwise be summed into its first results.
@@ -155,7 +155,7 @@ class ListScheduler:
         """(earliest load start w, loads, s_off, uses) of pass ps in weight slot `slot`."""
         p = self.p
         R, stream = p.rows, len(ps["ab"])
-        # (WeightBuffer row, weight port address, wbRead.shiftAmt): the pass's own
+        # (WeightBuffer row, weight port address, wbRead.rotate): the pass's own
         # weights, then zeros for other arrays' rows its operand lanes (< wrows) would meet
         if rows_pass:
             loads = [(row, a, 0) for row, a in ps["loads"]]
@@ -232,7 +232,7 @@ class ListScheduler:
         S = w + s_off
         tb = self.table
         for j, (row, addr, shift) in enumerate(loads):
-            tb.put(w + j, {"wbRead.en": 1, "wbRead.addr": row, **({"wbRead.shiftAmt": shift} if shift else {})})
+            tb.put(w + j, {"wbRead.en": 1, "wbRead.addr": row, **({"wbRead.rotate": shift} if shift else {})})
             tb.put(w + p.wb_read_latency + j, {"weightPort.en": 1, "weightPort.addr": addr, "weightPort.slot": slot})
             k = addr // R
             if not self.wide and k < self.arrays - 1:

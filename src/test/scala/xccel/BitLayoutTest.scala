@@ -22,6 +22,7 @@ class BitLayoutTest extends AnyFlatSpec with ChiselScalatestTester {
       def leaves(d: Data): Seq[Data] = d match {
         case r: Record => r.elements.values.toSeq.flatMap(leaves)
         case v: Vec[_] => v.flatMap(leaves)
+        case e if e.getWidth == 0 => Seq() // not in the layout, and not pokeable
         case e => Seq(e)
       }
       def byPath(path: String): Data = path.split('.').foldLeft(c.io.in: Data) {

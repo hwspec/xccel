@@ -69,7 +69,7 @@ class AccumulatorIO(cfg: AccumulatorConfig) extends Bundle {
 
   val readAddr = Input(UInt(cfg.addrWidth.W))
   val readEn = Input(Bool())
-  val shiftAmt = Input(UInt(cfg.laneSwitch.shiftWidth.W))
+  val rotate = Input(UInt(cfg.laneSwitch.rotateWidth.W))
   val fanout = Input(UInt(cfg.laneSwitch.fanoutWidth.W))
   val accOut = Valid(Vec(cfg.cu.numOutputs, UInt(cfg.cu.outputWidth.W)))
 }
@@ -135,11 +135,11 @@ class Accumulator(cfg: AccumulatorConfig) extends Module {
     wch.wmask := fullMask
   }
 
-  private val shiftAmtPipe = ShiftRegister(io.shiftAmt, cfg.readLatency, 0.U(cfg.laneSwitch.shiftWidth.W), true.B)
+  private val rotatePipe = ShiftRegister(io.rotate, cfg.readLatency, 0.U(cfg.laneSwitch.rotateWidth.W), true.B)
   private val fanoutPipe =
     ShiftRegister(io.fanout, cfg.readLatency, 0.U(cfg.laneSwitch.fanoutWidth.W), true.B)
   private val drainBank = ShiftRegister(bankOf(io.readAddr), cfg.readLatency, 0.U, true.B)
 
-  io.accOut.bits := LaneSwitch.connect(cfg.laneSwitch, fromBank(drainBank), shiftAmtPipe, fanoutPipe)
+  io.accOut.bits := LaneSwitch.connect(cfg.laneSwitch, fromBank(drainBank), rotatePipe, fanoutPipe)
   io.accOut.valid := ShiftRegister(io.readEn, cfg.readLatency, false.B, true.B)
 }

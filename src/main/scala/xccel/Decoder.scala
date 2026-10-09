@@ -13,12 +13,12 @@ import chisel3.util._
 // job, expressed by placing the right slot in the right word.
 
 // Microcode slot for a buffer read (WeightBuffer, Accumulator drain).
-class ReadSlot(addrWidth: Int, shiftWidth: Int, fanoutWidth: Int) extends Bundle {
+class ReadSlot(addrWidth: Int, rotateWidth: Int, fanoutWidth: Int) extends Bundle {
   val en = Bool()
   val addr = UInt(addrWidth.W)
   val addrStride = UInt(addrWidth.W)
-  val shiftAmt = UInt(shiftWidth.W)
-  val shiftStride = UInt(shiftWidth.W)
+  val rotate = UInt(rotateWidth.W)
+  val rotateStride = UInt(rotateWidth.W)
   val fanout = UInt(fanoutWidth.W)
 }
 
@@ -27,8 +27,8 @@ class ReadSlot(addrWidth: Int, shiftWidth: Int, fanoutWidth: Int) extends Bundle
 // // ActivationBuffer read: adds the line-buffer shiftIn, held for the whole
 // // word. A RESELECT sweep (shiftIn only on its last step) is therefore two
 // // words: cycles-1 cycles with shiftIn=0, then 1 cycle with shiftIn=1.
-class ActivationReadSlot(addrWidth: Int, shiftWidth: Int, fanoutWidth: Int)
-    extends ReadSlot(addrWidth, shiftWidth, fanoutWidth) {
+class ActivationReadSlot(addrWidth: Int, rotateWidth: Int, fanoutWidth: Int)
+    extends ReadSlot(addrWidth, rotateWidth, fanoutWidth) {
   // val shiftIn = Bool()
 }
 
@@ -117,7 +117,7 @@ class ComputeSlot extends Bundle {
 class MicroWord(cfg: DecoderConfig) extends Bundle {
   val wbRead = new ReadSlot(
     cfg.weightBuffer.sram.addrWidth,
-    cfg.weightBuffer.laneSwitch.shiftWidth,
+    cfg.weightBuffer.laneSwitch.rotateWidth,
     cfg.weightBuffer.laneSwitch.fanoutWidth,
   )
   val wbWrite = new WeightWriteSlot(cfg.weightBuffer.sram.addrWidth, cfg.transposerIndexWidth)
@@ -125,14 +125,14 @@ class MicroWord(cfg: DecoderConfig) extends Bundle {
   val abWrite = new ActivationWriteSlot(cfg.activationBuffer.sram.addrWidth)
   val abRead = new ActivationReadSlot(
     cfg.activationBuffer.sram.addrWidth,
-    cfg.activationBuffer.laneSwitch.shiftWidth,
+    cfg.activationBuffer.laneSwitch.rotateWidth,
     cfg.activationBuffer.laneSwitch.fanoutWidth,
   )
   val compute = new ComputeSlot
   val accWrite = new AccWriteSlot(cfg.accumulator.addrWidth)
   val accRead = new ReadSlot(
     cfg.accumulator.addrWidth,
-    cfg.accumulator.laneSwitch.shiftWidth,
+    cfg.accumulator.laneSwitch.rotateWidth,
     cfg.accumulator.laneSwitch.fanoutWidth,
   )
   val requant = new RequantSlot(cfg.requantSetWidth)
@@ -144,15 +144,15 @@ class MicroWord(cfg: DecoderConfig) extends Bundle {
 }
 
 // Per-cycle resolved control signals (strides already applied).
-class ReadCtrl(addrWidth: Int, shiftWidth: Int, fanoutWidth: Int) extends Bundle {
+class ReadCtrl(addrWidth: Int, rotateWidth: Int, fanoutWidth: Int) extends Bundle {
   val en = Bool()
   val addr = UInt(addrWidth.W)
-  val shiftAmt = UInt(shiftWidth.W)
+  val rotate = UInt(rotateWidth.W)
   val fanout = UInt(fanoutWidth.W)
 }
 
-class ActivationReadCtrl(addrWidth: Int, shiftWidth: Int, fanoutWidth: Int)
-    extends ReadCtrl(addrWidth, shiftWidth, fanoutWidth) {
+class ActivationReadCtrl(addrWidth: Int, rotateWidth: Int, fanoutWidth: Int)
+    extends ReadCtrl(addrWidth, rotateWidth, fanoutWidth) {
   // val shiftIn = Bool() // line buffer disabled, see ActivationReadSlot
 }
 
@@ -232,7 +232,7 @@ class DecoderIO(cfg: DecoderConfig) extends Bundle {
 
   val wbRead = Output(new ReadCtrl(
     cfg.weightBuffer.sram.addrWidth,
-    cfg.weightBuffer.laneSwitch.shiftWidth,
+    cfg.weightBuffer.laneSwitch.rotateWidth,
     cfg.weightBuffer.laneSwitch.fanoutWidth,
   ))
   val wbWrite = Output(new WeightWriteCtrl(cfg.weightBuffer.sram.addrWidth, cfg.transposerIndexWidth))
@@ -240,7 +240,7 @@ class DecoderIO(cfg: DecoderConfig) extends Bundle {
   val abWrite = Output(new ActivationWriteCtrl(cfg.activationBuffer.sram.addrWidth))
   val abRead = Output(new ActivationReadCtrl(
     cfg.activationBuffer.sram.addrWidth,
-    cfg.activationBuffer.laneSwitch.shiftWidth,
+    cfg.activationBuffer.laneSwitch.rotateWidth,
     cfg.activationBuffer.laneSwitch.fanoutWidth,
   ))
   val weightSelect = Output(Bool())
@@ -251,7 +251,7 @@ class DecoderIO(cfg: DecoderConfig) extends Bundle {
   val accWrite = Output(new AccWriteCtrl(cfg.accumulator.addrWidth))
   val accRead = Output(new ReadCtrl(
     cfg.accumulator.addrWidth,
-    cfg.accumulator.laneSwitch.shiftWidth,
+    cfg.accumulator.laneSwitch.rotateWidth,
     cfg.accumulator.laneSwitch.fanoutWidth,
   ))
 }
@@ -304,7 +304,7 @@ class Decoder(cfg: DecoderConfig) extends Module {
   private def resolveRead(slot: ReadSlot, ctrl: ReadCtrl): Unit = {
     ctrl.en := running && slot.en
     ctrl.addr := strided(slot.addr, slot.addrStride)
-    ctrl.shiftAmt := strided(slot.shiftAmt, slot.shiftStride)
+    ctrl.rotate := strided(slot.rotate, slot.rotateStride)
     ctrl.fanout := slot.fanout
   }
 

@@ -30,8 +30,8 @@ class WeightBufferSystolicHarness(
     val wbEn = Input(Bool())
     val wbWen = Input(Bool())
     val wbWdata = Input(Vec(wbCfg.totalWordsPerRow, UInt(cuCfg.weightWidth.W)))
-    val wbShiftAmt = Input(UInt(wbCfg.laneSwitch.shiftWidth.W))
-    val wbGroupShift = Input(UInt(wbCfg.laneSwitch.groupShiftWidth.W))
+    val wbRotate = Input(UInt(wbCfg.laneSwitch.rotateWidth.W))
+    val wbFanout = Input(UInt(wbCfg.laneSwitch.fanoutWidth.W))
 
     val operandIn = Flipped(Valid(Vec(cuCfg.numInputs, UInt(cuCfg.inputWidth.W))))
     val resultOut = Valid(Vec(cuCfg.numOutputs, SInt(cuCfg.outputWidth.W)))
@@ -46,8 +46,8 @@ class WeightBufferSystolicHarness(
   weightBuffer.io.writeAddr := io.wbAddr
   weightBuffer.io.writeEn := io.wbEn && io.wbWen
   weightBuffer.io.wdata := io.wbWdata
-  weightBuffer.io.shiftAmt := io.wbShiftAmt
-  weightBuffer.io.groupShift := io.wbGroupShift
+  weightBuffer.io.rotate := io.wbRotate
+  weightBuffer.io.fanout := io.wbFanout
 
   compute.weightWriteEn := weightBuffer.io.weightOut.valid
   compute.weightWriteData := weightBuffer.io.weightOut.bits
@@ -73,8 +73,8 @@ class WeightBufferTest extends AnyFlatSpec with ChiselScalatestTester {
     )
     test(new WeightBuffer(cfg)) { c =>
       val rows = Seq(Seq(1, 2), Seq(3, 4), Seq(5, 6))
-      c.io.shiftAmt.poke(0.U)
-      c.io.groupShift.poke(0.U) // unicast
+      c.io.rotate.poke(0.U)
+      c.io.fanout.poke(0.U) // unicast
 
       for ((row, r) <- rows.zipWithIndex) {
         c.io.writeAddr.poke(r.U)
@@ -110,8 +110,8 @@ class WeightBufferTest extends AnyFlatSpec with ChiselScalatestTester {
     )
     test(new WeightBuffer(cfg)) { c =>
       val rows = Seq(Seq(1, 2, 3, 4), Seq(5, 6, 7, 8), Seq(9, 10, 11, 12))
-      c.io.shiftAmt.poke(0.U)
-      c.io.groupShift.poke(0.U) // unicast
+      c.io.rotate.poke(0.U)
+      c.io.fanout.poke(0.U) // unicast
 
       for ((row, r) <- rows.zipWithIndex) {
         c.io.writeAddr.poke(r.U)
@@ -135,7 +135,7 @@ class WeightBufferTest extends AnyFlatSpec with ChiselScalatestTester {
     }
   }
 
-  it should "select the right cols-wide window via shiftAmt (several banks, several columns, several resident tiles, unicast)" in {
+  it should "select the right cols-wide window via rotate (several banks, several columns, several resident tiles, unicast)" in {
     val cuCfg = ComputeUnitConfig(numInputs = 3, numOutputs = 2, inputWidth = 8, weightWidth = 8, outputWidth = 20)
     // 3 tiles resident side by side across the bank dimension: A at banks
     // [0,1], B at [2,3], C at [4,5]
@@ -145,7 +145,7 @@ class WeightBufferTest extends AnyFlatSpec with ChiselScalatestTester {
       val tileA = Seq(Seq(1, 2), Seq(3, 4), Seq(5, 6))
       val tileB = Seq(Seq(10, 20), Seq(30, 40), Seq(50, 60))
       val tileC = Seq(Seq(100, 101), Seq(102, 103), Seq(104, 105))
-      c.io.groupShift.poke(0.U) // unicast
+      c.io.fanout.poke(0.U) // unicast
 
       for (r <- 0 until cuCfg.numInputs) {
         c.io.writeAddr.poke(r.U)
@@ -162,7 +162,7 @@ class WeightBufferTest extends AnyFlatSpec with ChiselScalatestTester {
         for ((row, r) <- tile.zipWithIndex) {
           c.io.readAddr.poke(r.U)
           c.io.readEn.poke(true.B)
-          c.io.shiftAmt.poke(shamt.U)
+          c.io.rotate.poke(shamt.U)
           c.clock.step(cfg.readLatency)
           c.io.weightOut.valid.expect(true.B)
           for ((v, col) <- row.zipWithIndex) c.io.weightOut.bits(col).expect(v.U)
@@ -173,7 +173,7 @@ class WeightBufferTest extends AnyFlatSpec with ChiselScalatestTester {
     }
   }
 
-  it should "broadcast one input lane to every output lane when groupShift = log2(cols)" in {
+  it should "broadcast one input lane to every output lane when fanout = log2(cols)" in {
     val cuCfg = ComputeUnitConfig(numInputs = 2, numOutputs = 4, inputWidth = 8, weightWidth = 8, outputWidth = 20)
     val cfg =
       WeightBufferConfig(cuCfg, numBanks = 4, wordsPerBank = 1, tiles = 1, readLatency = 1, writeLatency = 1)
@@ -190,10 +190,10 @@ class WeightBufferTest extends AnyFlatSpec with ChiselScalatestTester {
 
       c.io.readAddr.poke(0.U)
       c.io.readEn.poke(true.B)
-      c.io.groupShift.poke(2.U) // log2(4) = broadcast
+      c.io.fanout.poke(2.U) // log2(4) = broadcast
 
       for (shamt <- row.indices) {
-        c.io.shiftAmt.poke(shamt.U)
+        c.io.rotate.poke(shamt.U)
         c.clock.step(cfg.readLatency)
         c.io.weightOut.valid.expect(true.B)
         for (i <- row.indices) c.io.weightOut.bits(i).expect(row(shamt).U)
@@ -203,7 +203,7 @@ class WeightBufferTest extends AnyFlatSpec with ChiselScalatestTester {
     }
   }
 
-  it should "multicast in groups of 2 when groupShift = 1 (between unicast and broadcast)" in {
+  it should "multicast in groups of 2 when fanout = 1 (between unicast and broadcast)" in {
     val cuCfg = ComputeUnitConfig(numInputs = 2, numOutputs = 4, inputWidth = 8, weightWidth = 8, outputWidth = 20)
     val cfg =
       WeightBufferConfig(cuCfg, numBanks = 4, wordsPerBank = 1, tiles = 1, readLatency = 1, writeLatency = 1)
@@ -220,8 +220,8 @@ class WeightBufferTest extends AnyFlatSpec with ChiselScalatestTester {
 
       c.io.readAddr.poke(0.U)
       c.io.readEn.poke(true.B)
-      c.io.shiftAmt.poke(0.U)
-      c.io.groupShift.poke(1.U) // groupSize = 2
+      c.io.rotate.poke(0.U)
+      c.io.fanout.poke(1.U) // groupSize = 2
       c.clock.step(cfg.readLatency)
 
       c.io.weightOut.valid.expect(true.B)
@@ -247,8 +247,8 @@ class WeightBufferTest extends AnyFlatSpec with ChiselScalatestTester {
     ) { c =>
       def toU(v: Int, width: Int): UInt = (BigInt(v) & ((BigInt(1) << width) - 1)).U(width.W)
 
-      c.io.wbShiftAmt.poke(0.U)
-      c.io.wbGroupShift.poke(0.U) // unicast
+      c.io.wbRotate.poke(0.U)
+      c.io.wbFanout.poke(0.U) // unicast
 
       val weightRows = Seq(Seq(1, 2), Seq(3, 4), Seq(5, 6))
       for ((row, r) <- weightRows.zipWithIndex) {
@@ -299,8 +299,8 @@ class WeightBufferTest extends AnyFlatSpec with ChiselScalatestTester {
     val cfg = WeightBufferConfig(cuCfg, numBanks = cuCfg.numOutputs, wordsPerBank = 1, tiles = 1,
       readLatency = 2, writeLatency = 2, portType = portType)
     test(new WeightBuffer(cfg)) { c =>
-      c.io.shiftAmt.poke(0.U)
-      c.io.groupShift.poke(0.U)
+      c.io.rotate.poke(0.U)
+      c.io.fanout.poke(0.U)
       def write(r: Int, row: Seq[Int]): Unit = {
         c.io.writeAddr.poke(r.U)
         c.io.writeEn.poke(true.B)
