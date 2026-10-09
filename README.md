@@ -27,11 +27,14 @@ These four **static** connectivities between lanes (i.e., how to wire lanes betw
 
 Besides, SRAM macros can take several patterns of ports including 1rw, 1r1w, and 2rw.
 
-For **dynamic** cast modes (i.e., how to pass data on the lane at runtime), including unicast, multicast, and broadcast, can be considered.
-This cast mode is implemented by the shifter and mux.
+For **dynamic** cast modes (i.e., how to pass data on the lane at runtime), including unicast, multicast, and broadcast, are implemented.
 
-- shiftAmt: implemented by a barrel shifter between components (e.g., interface of SRAM and systolic array mesh)
-- groupShift: how many consecutive output lanes (e.g., compute-unit inputs) share one group of input lanes (e.g., words of an SRAM row)
+- shiftAmt: implemented by a barrel shifter between components (e.g., interface between SRAM and systolic array mesh)
+- fanout: log2 of how many consecutive output lanes share one group of input lanes (e.g., broadcasting: each mesh takes the same data loaded from a single address)
+- maxFanout (static, `{wb,ab,acc}_max_fanout`): the largest fanout built per buffer; `-1` = up to broadcast, `0` = unicast only (no group muxes, and fanout drops out of the microword). All `AxiXccel` builds default to `0`.
+  - 0: unicast, 1 <= N < log2Ceil(numOut): multicast, log2Ceil(numOut): broadcast
+
+![LaneSwitch](./laneswitch.png)
 
 
 ## Horizontal Microcode
@@ -45,7 +48,7 @@ To realize deterministic dataflow architecture, Xccel adopts the horizontal micr
 |              | addrStride      | UInt(wbAddrWidth.W)                            |
 |              | shiftAmt        | UInt(wbShiftWidth.W)                           |
 |              | shiftStride     | UInt(wbShiftWidth.W)                           |
-|              | groupShift      | UInt(wbGroupShiftWidth.W)                      |
+|              | fanout          | UInt(wbFanoutWidth.W)                          |
 | wbWrite      | en              | Bool                                           |
 |              | addr            | UInt(wbAddrWidth.W)                            |
 |              | addrStride      | UInt(wbAddrWidth.W)                            |
@@ -66,7 +69,7 @@ To realize deterministic dataflow architecture, Xccel adopts the horizontal micr
 |              | addrStride      | UInt(abAddrWidth.W)                            |
 |              | shiftAmt        | UInt(abShiftWidth.W)                           |
 |              | shiftStride     | UInt(abShiftWidth.W)                           |
-|              | groupShift      | UInt(abGroupShiftWidth.W)                      |
+|              | fanout          | UInt(abFanoutWidth.W)                          |
 | compute      | weightSelect    | Bool                                           |
 | accWrite     | addr            | UInt(accAddrWidth.W)                           |
 |              | addrStride      | UInt(accAddrWidth.W)                           |
@@ -76,7 +79,7 @@ To realize deterministic dataflow architecture, Xccel adopts the horizontal micr
 |              | addrStride      | UInt(accAddrWidth.W)                           |
 |              | shiftAmt        | UInt(accShiftWidth.W)                          |
 |              | shiftStride     | UInt(accShiftWidth.W)                          |
-|              | groupShift      | UInt(accGroupShiftWidth.W)                     |
+|              | fanout          | UInt(accFanoutWidth.W)                         |
 | requant      | paramSet        | UInt(requantSetWidth.W)                        |
 | transposer   | capture         | Bool                                           |
 |              | row             | UInt(transposerIndexWidth.W)                   |
@@ -105,11 +108,11 @@ To realize deterministic dataflow architecture, Xccel adopts the horizontal micr
 |--------------------------------------|-------------------------------------------------------|
 | wbAddrWidth                          | log2Ceil(WeightBuffer rows)                           |
 | wbShiftWidth                         | log2Ceil(words per WeightBuffer row)                  |
-| wbGroupShiftWidth                    | log2Ceil(log2Ceil(weight lanes) + 1)                  |
+| wbFanoutWidth                        | log2Ceil(maxFanout + 1) (0: field absent)             |
 | abAddrWidth                          | log2Ceil(ActivationBuffer rows)                       |
-| abShiftWidth / abGroupShiftWidth     | ActivationBuffer LaneSwitch (input lanes = rows R)    |
+| abShiftWidth / abFanoutWidth         | ActivationBuffer LaneSwitch (input lanes = rows R)    |
 | accAddrWidth                         | log2Ceil(Accumulator rows)                            |
-| accShiftWidth / accGroupShiftWidth   | Accumulator LaneSwitch (input lanes = cols C)         |
+| accShiftWidth / accFanoutWidth       | Accumulator LaneSwitch (input lanes = cols C)         |
 | weightPortAddrWidth                  | log2Ceil(compute unit weight beats)                   |
 | transposerIndexWidth                 | log2Ceil(C)                                           |
 | requantSetWidth                      | max(1, log2Ceil(Requantizer parameter sets))          |

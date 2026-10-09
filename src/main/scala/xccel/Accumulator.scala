@@ -14,6 +14,9 @@ case class AccumulatorConfig(
   // bank k), each its own OneR1W SRAM: an accumulating beat and a drain may
   // use the read ports of two different banks in the same cycle.
   rowBanks: Int = 1,
+  // largest LaneSwitch fanout built (see LaneSwitchConfig): None = up to
+  // broadcast, Some(0) = unicast only
+  maxFanout: Option[Int] = None,
 ) {
   require(depth > 0, "depth must be positive")
   require(rowBanks > 0 && depth % rowBanks == 0, "rowBanks must divide depth")
@@ -54,6 +57,7 @@ case class AccumulatorConfig(
     numOut = cu.numOutputs,
     inPerOut = 1,
     laneWidth = cu.outputWidth,
+    maxFanout = maxFanout,
   )
 }
 
@@ -66,7 +70,7 @@ class AccumulatorIO(cfg: AccumulatorConfig) extends Bundle {
   val readAddr = Input(UInt(cfg.addrWidth.W))
   val readEn = Input(Bool())
   val shiftAmt = Input(UInt(cfg.laneSwitch.shiftWidth.W))
-  val groupShift = Input(UInt(cfg.laneSwitch.groupShiftWidth.W))
+  val fanout = Input(UInt(cfg.laneSwitch.fanoutWidth.W))
   val accOut = Valid(Vec(cfg.cu.numOutputs, UInt(cfg.cu.outputWidth.W)))
 }
 
@@ -132,10 +136,10 @@ class Accumulator(cfg: AccumulatorConfig) extends Module {
   }
 
   private val shiftAmtPipe = ShiftRegister(io.shiftAmt, cfg.readLatency, 0.U(cfg.laneSwitch.shiftWidth.W), true.B)
-  private val groupShiftPipe =
-    ShiftRegister(io.groupShift, cfg.readLatency, 0.U(cfg.laneSwitch.groupShiftWidth.W), true.B)
+  private val fanoutPipe =
+    ShiftRegister(io.fanout, cfg.readLatency, 0.U(cfg.laneSwitch.fanoutWidth.W), true.B)
   private val drainBank = ShiftRegister(bankOf(io.readAddr), cfg.readLatency, 0.U, true.B)
 
-  io.accOut.bits := LaneSwitch.connect(cfg.laneSwitch, fromBank(drainBank), shiftAmtPipe, groupShiftPipe)
+  io.accOut.bits := LaneSwitch.connect(cfg.laneSwitch, fromBank(drainBank), shiftAmtPipe, fanoutPipe)
   io.accOut.valid := ShiftRegister(io.readEn, cfg.readLatency, false.B, true.B)
 }

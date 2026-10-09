@@ -176,7 +176,7 @@ class Xccel(cfg: XccelConfig) extends Module {
     weightBuffer.io.wdata := io.wbWriteData
   }
   weightBuffer.io.shiftAmt := wb.shiftAmt
-  weightBuffer.io.groupShift := wb.groupShift
+  weightBuffer.io.fanout := wb.fanout
 
   // the weight port has no valid of its own: its strobe and row address
   // come straight from the program's weightPort slot
@@ -204,7 +204,7 @@ class Xccel(cfg: XccelConfig) extends Module {
     activationBuffer.io.wdata := io.abWriteData
   }
   activationBuffer.io.shiftAmt := ab.shiftAmt
-  activationBuffer.io.groupShift := ab.groupShift
+  activationBuffer.io.fanout := ab.fanout
   // activationBuffer.io.shiftIn := ab.shiftIn // line buffer disabled (accumulating kn2row)
 
   // a beat the program routes to the residual scaler never enters the array
@@ -236,7 +236,7 @@ class Xccel(cfg: XccelConfig) extends Module {
   accumulator.io.readAddr := Mux(acc.en, acc.addr, io.accReadAddr)
   accumulator.io.readEn := acc.en || io.accReadEn
   accumulator.io.shiftAmt := Mux(acc.en, acc.shiftAmt, 0.U)
-  accumulator.io.groupShift := Mux(acc.en, acc.groupShift, 0.U)
+  accumulator.io.fanout := Mux(acc.en, acc.fanout, 0.U)
 
   requantizer.io.in <> accumulator.io.accOut
   requantizer.io.paramSet := Mux(decoder.io.running, decoder.io.requantParamSet, io.accReadParamSet)

@@ -14,6 +14,9 @@ case class WeightBufferConfig(
   // lanes of the weight beat handed to the compute unit (its weightBeatElems);
   // 0 = cu.numOutputs (one array row per beat)
   weightLanes: Int = 0,
+  // largest LaneSwitch fanout built (see LaneSwitchConfig): None = up to
+  // broadcast, Some(0) = unicast only
+  maxFanout: Option[Int] = None,
 ) {
   require(tiles > 0, "tiles must be positive")
   require(wordsPerBank > 0, "wordsPerBank must be positive")
@@ -38,6 +41,7 @@ case class WeightBufferConfig(
     numOut = numWeightLanes,
     inPerOut = 1,
     laneWidth = cu.weightWidth,
+    maxFanout = maxFanout,
   )
 }
 
@@ -50,7 +54,7 @@ class WeightBufferIO(cfg: WeightBufferConfig) extends Bundle {
   val writeEn = Input(Bool())
   val wdata = Input(Vec(cfg.totalWordsPerRow, UInt(cfg.cu.weightWidth.W)))
   val shiftAmt = Input(UInt(cfg.laneSwitch.shiftWidth.W))
-  val groupShift = Input(UInt(cfg.laneSwitch.groupShiftWidth.W))
+  val fanout = Input(UInt(cfg.laneSwitch.fanoutWidth.W))
 
   // one weight beat of the compute unit (HasStationaryWeights.weightWriteData)
   val weightOut = Valid(Vec(cfg.numWeightLanes, UInt(cfg.cu.weightWidth.W)))
@@ -81,9 +85,9 @@ class WeightBuffer(cfg: WeightBufferConfig) extends Module {
   })
 
   private val shiftAmtPipe = ShiftRegister(io.shiftAmt, cfg.readLatency, 0.U(cfg.laneSwitch.shiftWidth.W), true.B)
-  private val groupShiftPipe =
-    ShiftRegister(io.groupShift, cfg.readLatency, 0.U(cfg.laneSwitch.groupShiftWidth.W), true.B)
+  private val fanoutPipe =
+    ShiftRegister(io.fanout, cfg.readLatency, 0.U(cfg.laneSwitch.fanoutWidth.W), true.B)
 
-  io.weightOut.bits := LaneSwitch.connect(cfg.laneSwitch, flatWords, shiftAmtPipe, groupShiftPipe)
+  io.weightOut.bits := LaneSwitch.connect(cfg.laneSwitch, flatWords, shiftAmtPipe, fanoutPipe)
   io.weightOut.valid := ShiftRegister(io.readEn, cfg.readLatency, false.B, true.B)
 }

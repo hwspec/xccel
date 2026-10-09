@@ -96,6 +96,10 @@ case class XccelModuleParams(
   wb_words_per_bank: Int, // WeightBuffer row = cols banks x wb_words_per_bank words
   softmax_row_beats: Int, // Softmax row buffer beats per row (0: none)
   compute_tree: Boolean, // ReductionTree arrays instead of SystolicArrays
+  // largest LaneSwitch fanout per buffer (-1: up to broadcast, 0: unicast only)
+  wb_max_fanout: Int,
+  ab_max_fanout: Int,
+  acc_max_fanout: Int,
 ) extends AxiModuleParams with AxiModuleDefParams {
   val moduleName = "Xccel"
 
@@ -106,6 +110,8 @@ case class XccelModuleParams(
     case other => throw new IllegalArgumentException(s"unknown port type $other")
   }
 
+  private def maxFanout(n: Int): Option[Int] = if (n < 0) None else Some(n)
+
   def xccelConfig: XccelConfig = {
     val cu = ComputeUnitConfig(rows, cols, input_width, weight_width, output_width)
     require(wb_rows % rows == 0, "wb_rows must be a multiple of rows (whole weight tiles)")
@@ -113,11 +119,14 @@ case class XccelModuleParams(
       cu,
       WeightBufferConfig(cu, numBanks = cols, wordsPerBank = wb_words_per_bank, tiles = wb_rows / rows,
         readLatency = wb_read_latency, writeLatency = wb_write_latency, portType = portType(wb_port_type),
-        weightLanes = if (compute_arrays > 1 && compute_wide_weights) compute_arrays * cols else 0),
+        weightLanes = if (compute_arrays > 1 && compute_wide_weights) compute_arrays * cols else 0,
+        maxFanout = maxFanout(wb_max_fanout)),
       ActivationBufferConfig(cu, numBanks = rows, wordsPerBank = 1, depth = ab_rows,
-        readLatency = ab_read_latency, writeLatency = ab_write_latency, portType = portType(ab_port_type)),
+        readLatency = ab_read_latency, writeLatency = ab_write_latency, portType = portType(ab_port_type),
+        maxFanout = maxFanout(ab_max_fanout)),
       AccumulatorConfig(cu, numBanks = cols, wordsPerBank = 1, depth = acc_rows,
-        readLatency = acc_read_latency, writeLatency = acc_write_latency, rowBanks = acc_row_banks),
+        readLatency = acc_read_latency, writeLatency = acc_write_latency, rowBanks = acc_row_banks,
+        maxFanout = maxFanout(acc_max_fanout)),
       requantizedWidth = requantized_width,
       programLength = program_length,
       maxRunLength = max_run_length,
@@ -190,12 +199,17 @@ object XccelModuleParams {
     wb_words_per_bank = 1,
     softmax_row_beats = 0,
     compute_tree = false,
+    // BraggNN programs read unicast only
+    wb_max_fanout = 0,
+    ab_max_fanout = 0,
+    acc_max_fanout = 0,
   )
 }
 
 // Bit layout of a Chisel type as packed by asUInt: path -> (lsb, width).
 // A Bundle packs its first declared field in the most significant bits; a
-// Vec packs element 0 in the least significant bits.
+// Vec packs element 0 in the least significant bits. Zero-width fields (e.g.
+// a unicast-only fanout) are left out, so setting one is an unknown field.
 object BitLayout {
   def of(d: Data): Seq[(String, Int, Int)] = {
     def walk(d: Data, path: String, lsb: Int): Seq[(String, Int, Int)] = d match {
@@ -215,6 +229,7 @@ object BitLayout {
           at += child.getWidth
           sub
         }
+      case e if e.getWidth == 0 => Seq()
       case e => Seq((path, lsb, e.getWidth))
     }
     walk(d, "", 0)

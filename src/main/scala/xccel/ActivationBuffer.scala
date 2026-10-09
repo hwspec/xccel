@@ -15,6 +15,9 @@ case class ActivationBufferConfig(
   // 1x1 pass per kernel position, partial sums added in Accumulator). Kept
   // commented out for reference.
   // windowDepth: Int = 1, // For Im2Col (1 : disable line buffer, >1 : enable line buffer)
+  // largest LaneSwitch fanout built (see LaneSwitchConfig): None = up to
+  // broadcast, Some(0) = unicast only
+  maxFanout: Option[Int] = None,
 ) {
   require(depth > 0, "depth must be positive")
   require(wordsPerBank > 0, "wordsPerBank must be positive")
@@ -45,6 +48,7 @@ case class ActivationBufferConfig(
     numOut = rowWidth,
     inPerOut = 1,
     laneWidth = cu.inputWidth,
+    maxFanout = maxFanout,
   )
 }
 
@@ -57,7 +61,7 @@ class ActivationBufferIO(cfg: ActivationBufferConfig) extends Bundle {
   val writeEn = Input(Bool())
   val wdata = Input(Vec(cfg.totalWordsPerRow, UInt(cfg.cu.inputWidth.W)))
   val shiftAmt = Input(UInt(cfg.laneSwitch.shiftWidth.W))
-  val groupShift = Input(UInt(cfg.laneSwitch.groupShiftWidth.W))
+  val fanout = Input(UInt(cfg.laneSwitch.fanoutWidth.W))
   // Line buffer disabled: im2col is done by accumulating kn2row instead (one
   // 1x1 pass per kernel position, partial sums added in Accumulator). Kept
   // commented out for reference.
@@ -96,8 +100,8 @@ class ActivationBuffer(cfg: ActivationBufferConfig) extends Module {
   })
 
   private val shiftAmtPipe = ShiftRegister(io.shiftAmt, cfg.readLatency, 0.U(cfg.laneSwitch.shiftWidth.W), true.B)
-  private val groupShiftPipe =
-    ShiftRegister(io.groupShift, cfg.readLatency, 0.U(cfg.laneSwitch.groupShiftWidth.W), true.B)
+  private val fanoutPipe =
+    ShiftRegister(io.fanout, cfg.readLatency, 0.U(cfg.laneSwitch.fanoutWidth.W), true.B)
 
   io.operandOut.valid := ShiftRegister(io.readEn, cfg.readLatency, false.B, true.B)
 
@@ -119,6 +123,6 @@ class ActivationBuffer(cfg: ActivationBufferConfig) extends Module {
   // }
 
   // io.operandOut.bits :=
-  //   VecInit(rows.flatMap(row => LaneSwitch.connect(cfg.laneSwitch, row, shiftAmtPipe, groupShiftPipe).toSeq))
-  io.operandOut.bits := LaneSwitch.connect(cfg.laneSwitch, flatWords, shiftAmtPipe, groupShiftPipe)
+  //   VecInit(rows.flatMap(row => LaneSwitch.connect(cfg.laneSwitch, row, shiftAmtPipe, fanoutPipe).toSeq))
+  io.operandOut.bits := LaneSwitch.connect(cfg.laneSwitch, flatWords, shiftAmtPipe, fanoutPipe)
 }

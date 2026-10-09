@@ -3,13 +3,15 @@ package xccel
 import chisel3._
 import chisel3.util._
 
+// Barrel Shifter consumes log2Ceil(n) * n multiplexeres
+
 object BarrelShifter {
   def rotateLeft[T <: Data](in: Vec[T], shamt: UInt): Vec[T] = {
     val n = in.length
     val stages = log2Ceil(n)
     (0 until stages).foldLeft(in) { (cur, k) =>
       val step = 1 << k // 2^k
-      val doShift = shamt(k)
+      val doShift = shamt(k) // e.g., shamt = 5 (101) means shift 4 and 1 bit
       // each stage is a kept wire: otherwise firtool may inline the stages into
       // every output, a 2^stages-leaf mux tree per output instead of n muxes per stage
       val stage = Wire(Vec(n, chiselTypeOf(in.head)))
