@@ -33,10 +33,9 @@ case class ActivationBufferConfig(
   val rowWidth: Int = cu.numInputs
 
   val sram: SramConfig = SramConfig(
-    depth = totalWordsPerRow * depth,
-    wordLength = cu.inputWidth,
+    depth = depth,
+    width = wordsPerBank * cu.inputWidth,
     numBanks = numBanks,
-    bankBandwidth = wordsPerBank * cu.inputWidth,
     maskGranularity = cu.inputWidth,
     readLatency = readLatency,
     writeLatency = writeLatency,
@@ -93,6 +92,7 @@ class ActivationBuffer(cfg: ActivationBufferConfig) extends Module {
     io.writeAddr,
     io.writeEn,
     Seq.tabulate(cfg.numBanks)(n => Cat((0 until cfg.wordsPerBank).reverse.map(i => io.wdata(n * cfg.wordsPerBank + i)))),
+    Seq.fill(cfg.numBanks)(cfg.sram.fullMask),
   )
 
   private val flatWords = VecInit((0 until cfg.numBanks).flatMap { n =>

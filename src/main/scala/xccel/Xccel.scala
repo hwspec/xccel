@@ -213,7 +213,7 @@ class Xccel(cfg: XccelConfig) extends Module {
 
   // -- resultOut -> Accumulator: the write strobe is resultIn.valid
   // (self-timed), the address and add-vs-overwrite come from the program.
-  // An accumulating beat uses Accumulator's read channel, so the program
+  // An accumulating beat uses Accumulator's read port, so the program
   // must not schedule an accRead in the same cycle.
   if (cfg.residual) {
     val scaler = Module(new Requantizer(cfg.residualScaler))

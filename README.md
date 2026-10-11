@@ -2,7 +2,7 @@
 
 Xccel is a framework for exploring the SRAM design and compute unit in X-ray detector ASICs simulateniously.
 This framework abstracts near-sensor AI accelerators to the input activation buffer, weight buffer, accumulator, compute unit, and instraction decoder, assuming deterministic dataflow such as Groq.
-The user (whichever the human or AI agents) can specify the number of SRAMs and design of each buffer including depth, word length, the number of ports, port bandwidth, mask granularity, and read/write latency.
+The user (whichever the human or AI agents) can specify the number of SRAMs and design of each buffer including depth, width, the number of ports, mask granularity, and read/write latency.
 Moreover, the user can replace a compute unit with their IP such as systolic array, reduction tree, and vector engine.
 It does not have any caches, reservation station, and arbiters inside the accelerator since it adopts deterministic dataflow architecture.
 
@@ -27,7 +27,7 @@ These four **static** connectivities between lanes (i.e., how to wire lanes betw
 
 Besides, SRAM macros can take several patterns of ports including 1rw, 1r1w, and 2rw.
 
-For **dynamic** cast modes (i.e., how to pass data on the lane at runtime), including unicast, multicast, and broadcast, are implemented.
+For **dynamic** routing (i.e., how to pass data on the lane at runtime), including unicast, multicast, and broadcast, are implemented.
 
 - rotate: cyclic left rotation of the input lanes (window select), implemented by a barrel shifter between components (e.g., interface between SRAM and systolic array mesh)
 - fanout: log2 of how many consecutive output lanes share one group of input lanes (e.g., broadcasting: each mesh takes the same data loaded from a single address)
@@ -35,6 +35,11 @@ For **dynamic** cast modes (i.e., how to pass data on the lane at runtime), incl
 
 ![LaneSwitch](./laneswitch.png)
 
+## SRAM
+
+SRAMs are parameterized to realize a wide variety of SRAM configurations, allowing each instance to be tailored to its specific use case (e.g., weight buffer, accumulator, activation buffer, and instruction buffer).
+
+![sram](./sram.png)
 
 ## Horizontal Microcode
 

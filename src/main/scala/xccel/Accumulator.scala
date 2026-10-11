@@ -42,10 +42,9 @@ case class AccumulatorConfig(
 
   // one row bank
   val sram: SramConfig = SramConfig(
-    depth = totalWordsPerRow * rowsPerBank,
-    wordLength = cu.outputWidth,
+    depth = rowsPerBank,
+    width = wordsPerBank * cu.outputWidth,
     numBanks = numBanks,
-    bankBandwidth = wordsPerBank * cu.outputWidth,
     maskGranularity = cu.outputWidth,
     readLatency = readLatency,
     writeLatency = writeLatency,
@@ -78,7 +77,6 @@ class Accumulator(cfg: AccumulatorConfig) extends Module {
   val io = IO(new AccumulatorIO(cfg))
 
   private val srams = Seq.fill(cfg.rowBanks)(Module(new Sram(cfg.sram)))
-  private val fullMask = ((BigInt(1) << cfg.sram.maskBits) - 1).U(cfg.sram.maskBits.W)
   private val localWidth = cfg.sram.addrWidth
 
   // row bank of a global row address, and the row within it
@@ -90,7 +88,7 @@ class Accumulator(cfg: AccumulatorConfig) extends Module {
     row((i + 1) * cfg.cu.outputWidth - 1, i * cfg.cu.outputWidth)
 
   // Read-modify-write: an accumulating beat reads its row's old value
-  // through its row bank's read channel (so a drain of the same row bank
+  // through its row bank's read port (so a drain of the same row bank
   // must not be scheduled in the same cycle), is held readLatency cycles
   // until that value returns, then written as old + new. Non-accumulating
   // beats take the same delay, so write timing is one constant
@@ -101,20 +99,20 @@ class Accumulator(cfg: AccumulatorConfig) extends Module {
   private val wAddr = ShiftRegister(io.writeAddr, cfg.readLatency, 0.U(cfg.addrWidth.W), true.B)
   private val wData = ShiftRegister(io.resultIn.bits, cfg.readLatency)
 
-  // each row bank's rows as flat words, from its read-only channels (even index)
+  // each row bank's rows as flat words, from its read-only ports (even index)
   private val bankWords = srams.zipWithIndex.map { case (sram, b) =>
     val rmwHere = rmw && bankOf(io.writeAddr) === b.U
     val drainHere = io.readEn && bankOf(io.readAddr) === b.U
     for (n <- 0 until cfg.numBanks) {
-      val rch = sram.io.banks(2 * n)
-      rch.addr := Mux(rmwHere, local(io.writeAddr), local(io.readAddr))
-      rch.en := rmwHere || drainHere
-      rch.wen := false.B // unused by Sram's readOnlyAccess
-      rch.wdata := 0.U
-      rch.wmask := 0.U
+      val rp = sram.io.ports(2 * n)
+      rp.addr := Mux(rmwHere, local(io.writeAddr), local(io.readAddr))
+      rp.en := rmwHere || drainHere
+      rp.wen := false.B // unused by Sram's readOnlyAccess
+      rp.wdata := 0.U
+      rp.wmask := 0.U
     }
     VecInit((0 until cfg.numBanks).flatMap { n =>
-      (0 until cfg.wordsPerBank).map(i => wordSlice(sram.io.banks(2 * n).rdata, i))
+      (0 until cfg.wordsPerBank).map(i => wordSlice(sram.io.ports(2 * n).rdata, i))
     })
   }
   private def fromBank(bank: UInt): Vec[UInt] =
@@ -125,14 +123,14 @@ class Accumulator(cfg: AccumulatorConfig) extends Module {
     Mux(wAccumulate, oldWords(i).asSInt + wData(i), wData(i))
   ))
 
-  // write-only channel of each bank pair (odd index, per Sram's OneR1W layout)
+  // write-only port of each bank pair (odd index, per Sram's OneR1W layout)
   for ((sram, b) <- srams.zipWithIndex; n <- 0 until cfg.numBanks) {
-    val wch = sram.io.banks(2 * n + 1) // banks: [bank0-read, bank0-write, bank1-read, bank1-write, ...]
-    wch.addr := local(wAddr)
-    wch.en := wValid && bankOf(wAddr) === b.U
-    wch.wen := true.B // unused by Sram's writeOnlyAccess; set for clarity
-    wch.wdata := Cat((0 until cfg.wordsPerBank).reverse.map(i => sum(n * cfg.wordsPerBank + i).asUInt))
-    wch.wmask := fullMask
+    val wp = sram.io.ports(2 * n + 1) // ports: [bank0-read, bank0-write, bank1-read, bank1-write, ...]
+    wp.addr := local(wAddr)
+    wp.en := wValid && bankOf(wAddr) === b.U
+    wp.wen := true.B // unused by Sram's writeOnlyAccess; set for clarity
+    wp.wdata := Cat((0 until cfg.wordsPerBank).reverse.map(i => sum(n * cfg.wordsPerBank + i).asUInt))
+    wp.wmask := cfg.sram.fullMask
   }
 
   private val rotatePipe = ShiftRegister(io.rotate, cfg.readLatency, 0.U(cfg.laneSwitch.rotateWidth.W), true.B)
