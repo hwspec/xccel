@@ -13,6 +13,11 @@ It does not have any caches, reservation station, and arbiters inside the accele
 ```bash
 ./gwscript.py
 ```
+## Compute Unit
+
+The compute unit defines only the input size and output size. Therefore, you can switch the compute unit easily as long as following the interfaces (e.g., from the systolic array to reduction tree).
+
+![compute unit](./compute.png)
 
 ## Lane Connectivity
 
@@ -130,6 +135,16 @@ To realize deterministic dataflow architecture, Xccel adopts the horizontal micr
 
 
 ## Scheduler (tentative)
+
+## Results
+
+- 16x16 Systolic Array: 10,584 cycles
+- 64x64x9 Systolic Array: 2,663 cycles
+- 64x64x9 Reduction Tree: 1,392 cycles
+  - Weight Buffer: 64 banks, 2048x9words(8bit)=1,152KiB
+  - Activation Buffer: 64 banks, 2048x1word(8bit)=128KiB
+  - Accumulator: 128 banks, 512x1word(32bit)=256KiB
+  - Too big to build for FPGAs
 
 
 ## Related Works
