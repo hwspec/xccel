@@ -138,9 +138,13 @@ To realize deterministic dataflow architecture, Xccel adopts the horizontal micr
 
 ## Results
 
-- 16x16 Systolic Array: 10,584 cycles
-- 64x64x9 Systolic Array: 2,663 cycles
-- 64x64x9 Reduction Tree: 1,392 cycles
+We measured clock cycles for a variety of compute-unit configurations, including the systolic array (SA) and reduction tree (RT), using Verilator through GarageWorks.
+
+- 16x16x1 SA: 10,584 cycles
+- 16x16x9 SA: 7,392 cycles
+- 64x64x9 SA: 2,663 cycles
+- 32x32x9 RT: 2,124 cycles
+- 64x64x9 RT: 1,392 cycles
   - Weight Buffer: 64 banks, 2048x9words(8bit)=1,152KiB
   - Activation Buffer: 64 banks, 2048x1word(8bit)=128KiB
   - Accumulator: 128 banks, 512x1word(32bit)=256KiB
