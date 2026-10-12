@@ -6,6 +6,8 @@ The user (whichever the human or AI agents) can specify the number of SRAMs and 
 Moreover, the user can replace a compute unit with their IP such as systolic array, reduction tree, and vector engine.
 It does not have any caches, reservation station, and arbiters inside the accelerator since it adopts deterministic dataflow architecture.
 
+![Xccel](./xccel.png)
+
 ## Usage
 
 ```bash
