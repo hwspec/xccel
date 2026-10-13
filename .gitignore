@@ -9,3 +9,5 @@ __pycache__/
 .log
 generated/
 test/sim_build*
+tests/fpga_tb_*.py
+tests/fpga_xccel_bridge.py

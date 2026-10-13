@@ -1,4 +1,4 @@
-name=AxiXccel
+name=AxiXccelOpt9x32T
 package=xccel
 tests=braggnn_inference_opt
 fpgatest=false

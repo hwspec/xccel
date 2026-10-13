@@ -9,7 +9,7 @@ lazy val root = (project in file("."))
 
     // Include chisel-axi-utils Scala sources directly
     Compile / unmanagedSourceDirectories +=
-      baseDirectory.value / "chisel-axi-utils" / "src" / "main" / "scala",
+      baseDirectory.value / "garageworks" / "src" / "main" / "scala",
 
     libraryDependencies ++= Seq(
       "org.chipsalliance" %% "chisel" % chiselVersion,
