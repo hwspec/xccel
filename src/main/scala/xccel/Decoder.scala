@@ -12,14 +12,25 @@ import chisel3.util._
 // port shadowing a WeightBuffer read by its readLatency) is the program's
 // job, expressed by placing the right slot in the right word.
 
+// A strided row address of one bank address group (AddrGroups).
+class AddrSlot(addrWidth: Int) extends Bundle {
+  val addr = UInt(addrWidth.W)
+  val addrStride = UInt(addrWidth.W)
+}
+
 // Microcode slot for a buffer read (WeightBuffer, Accumulator drain).
-class ReadSlot(addrWidth: Int, rotateWidth: Int, fanoutWidth: Int) extends Bundle {
+// addr / addrStride address bank group 0 (all banks with one group);
+// groupAddr(g - 1) addresses group g.
+class ReadSlot(addrWidth: Int, rotateWidth: Int, fanoutWidth: Int, addrGroups: Int = 1, interleaveWidth: Int = 0)
+    extends Bundle {
   val en = Bool()
   val addr = UInt(addrWidth.W)
   val addrStride = UInt(addrWidth.W)
+  val groupAddr = AddrGroups.extra(addrGroups, new AddrSlot(addrWidth))
   val rotate = UInt(rotateWidth.W)
   val rotateStride = UInt(rotateWidth.W)
   val fanout = UInt(fanoutWidth.W)
+  val interleave = UInt(interleaveWidth.W) // LaneSwitch grouped / interleaved multicast
 }
 
 // ActivationBuffer read. The line-buffer shiftIn is disabled along with
@@ -27,26 +38,49 @@ class ReadSlot(addrWidth: Int, rotateWidth: Int, fanoutWidth: Int) extends Bundl
 // // ActivationBuffer read: adds the line-buffer shiftIn, held for the whole
 // // word. A RESELECT sweep (shiftIn only on its last step) is therefore two
 // // words: cycles-1 cycles with shiftIn=0, then 1 cycle with shiftIn=1.
-class ActivationReadSlot(addrWidth: Int, rotateWidth: Int, fanoutWidth: Int)
-    extends ReadSlot(addrWidth, rotateWidth, fanoutWidth) {
+class ActivationReadSlot(
+  addrWidth: Int, rotateWidth: Int, fanoutWidth: Int, addrGroups: Int = 1, interleaveWidth: Int = 0)
+    extends ReadSlot(addrWidth, rotateWidth, fanoutWidth, addrGroups, interleaveWidth) {
   // val shiftIn = Bool()
 }
 
-class WriteAddrSlot(addrWidth: Int) extends Bundle {
+// A write's row address; groupAddr as in ReadSlot.
+class WriteAddrSlot(addrWidth: Int, addrGroups: Int = 1) extends Bundle {
   val addr = UInt(addrWidth.W)
   val addrStride = UInt(addrWidth.W)
+  val groupAddr = AddrGroups.extra(addrGroups, new AddrSlot(addrWidth))
 }
 
 // Accumulator write side: its strobe is self-timed (resultIn.valid), so
-// only the address and whether to add to or overwrite the row.
-class AccWriteSlot(addrWidth: Int) extends WriteAddrSlot(addrWidth) {
+// the address, whether to add to or overwrite the row, and where the beat's
+// lanes land in the row (the Accumulator's writeSwitch).
+class AccWriteSlot(addrWidth: Int, rotateWidth: Int, fanoutWidth: Int, interleaveWidth: Int, addrGroups: Int = 1)
+    extends WriteAddrSlot(addrWidth, addrGroups) {
   val accumulate = Bool()
+  val rotate = UInt(rotateWidth.W)
+  val rotateStride = UInt(rotateWidth.W)
+  val fanout = UInt(fanoutWidth.W)
+  val interleave = UInt(interleaveWidth.W)
 }
 
 // Buffer write (WeightBuffer, ActivationBuffer): the program decides when
 // and where; the data comes from the host's data port in that same cycle.
-class WriteSlot(addrWidth: Int) extends WriteAddrSlot(addrWidth) {
+class WriteSlot(addrWidth: Int, addrGroups: Int = 1) extends WriteAddrSlot(addrWidth, addrGroups) {
   val en = Bool()
+}
+
+// A buffer write with where its words land in the row (the buffer's
+// writeSwitch, configured by sw). partial: a beat narrower than the row
+// (Requantizer, Transposer) writes only the words it lands on, the rest of
+// the row keeping its value; otherwise the whole row is written, zero
+// outside the beat.
+class BufferWriteSlot(addrWidth: Int, sw: LaneSwitchConfig, addrGroups: Int)
+    extends WriteSlot(addrWidth, addrGroups) {
+  val partial = Bool()
+  val rotate = UInt(sw.rotateWidth.W)
+  val rotateStride = UInt(sw.rotateWidth.W)
+  val fanout = UInt(sw.fanoutWidth.W)
+  val interleave = UInt(sw.interleaveWidth.W)
 }
 
 // WeightBuffer write: the data comes from the host, or, with
@@ -54,7 +88,8 @@ class WriteSlot(addrWidth: Int) extends WriteAddrSlot(addrWidth) {
 // activation used as weights, e.g. g in attention . g), or, with
 // transposed, from Transposer column `column` (e.g. phi^T in
 // theta . phi^T). transposed takes precedence over fromRequantizer.
-class WeightWriteSlot(addrWidth: Int, transposerIndexWidth: Int) extends WriteSlot(addrWidth) {
+class WeightWriteSlot(addrWidth: Int, transposerIndexWidth: Int, sw: LaneSwitchConfig, addrGroups: Int)
+    extends BufferWriteSlot(addrWidth, sw, addrGroups) {
   val fromRequantizer = Bool()
   val transposed = Bool()
   val column = UInt(transposerIndexWidth.W)
@@ -91,7 +126,8 @@ class TransposerSlot(indexWidth: Int) extends Bundle {
 // fromRequantizer, from the Requantizer output in that same cycle (the
 // layer-to-layer path: place it accumulator.readLatency after the accRead
 // that drains the row).
-class ActivationWriteSlot(addrWidth: Int) extends WriteSlot(addrWidth) {
+class ActivationWriteSlot(addrWidth: Int, sw: LaneSwitchConfig, addrGroups: Int)
+    extends BufferWriteSlot(addrWidth, sw, addrGroups) {
   val fromRequantizer = Bool()
 }
 
@@ -119,21 +155,36 @@ class MicroWord(cfg: DecoderConfig) extends Bundle {
     cfg.weightBuffer.sram.addrWidth,
     cfg.weightBuffer.laneSwitch.rotateWidth,
     cfg.weightBuffer.laneSwitch.fanoutWidth,
+    cfg.weightBuffer.addrGroups,
+    cfg.weightBuffer.laneSwitch.interleaveWidth,
   )
-  val wbWrite = new WeightWriteSlot(cfg.weightBuffer.sram.addrWidth, cfg.transposerIndexWidth)
+  val wbWrite =
+    new WeightWriteSlot(cfg.weightBuffer.sram.addrWidth, cfg.transposerIndexWidth, cfg.weightBuffer.writeSwitch,
+      cfg.weightBuffer.addrGroups)
   val weightPort = new WritePortSlot(cfg.weightPortAddrWidth)
-  val abWrite = new ActivationWriteSlot(cfg.activationBuffer.sram.addrWidth)
+  val abWrite = new ActivationWriteSlot(cfg.activationBuffer.sram.addrWidth, cfg.activationBuffer.writeSwitch,
+    cfg.activationBuffer.addrGroups)
   val abRead = new ActivationReadSlot(
     cfg.activationBuffer.sram.addrWidth,
     cfg.activationBuffer.laneSwitch.rotateWidth,
     cfg.activationBuffer.laneSwitch.fanoutWidth,
+    cfg.activationBuffer.addrGroups,
+    cfg.activationBuffer.laneSwitch.interleaveWidth,
   )
   val compute = new ComputeSlot
-  val accWrite = new AccWriteSlot(cfg.accumulator.addrWidth)
+  val accWrite = new AccWriteSlot(
+    cfg.accumulator.addrWidth,
+    cfg.accumulator.writeSwitch.rotateWidth,
+    cfg.accumulator.writeSwitch.fanoutWidth,
+    cfg.accumulator.writeSwitch.interleaveWidth,
+    cfg.accumulator.addrGroups,
+  )
   val accRead = new ReadSlot(
     cfg.accumulator.addrWidth,
     cfg.accumulator.laneSwitch.rotateWidth,
     cfg.accumulator.laneSwitch.fanoutWidth,
+    cfg.accumulator.addrGroups,
+    cfg.accumulator.laneSwitch.interleaveWidth,
   )
   val requant = new RequantSlot(cfg.requantSetWidth)
   val transposer = new TransposerSlot(cfg.transposerIndexWidth)
@@ -143,25 +194,40 @@ class MicroWord(cfg: DecoderConfig) extends Bundle {
   val halt = Bool() // stop after this word's last cycle
 }
 
-// Per-cycle resolved control signals (strides already applied).
-class ReadCtrl(addrWidth: Int, rotateWidth: Int, fanoutWidth: Int) extends Bundle {
+// Per-cycle resolved control signals (strides already applied). addr is
+// bank group 0's row, groupAddr(g - 1) group g's (AddrGroups).
+class ReadCtrl(addrWidth: Int, rotateWidth: Int, fanoutWidth: Int, addrGroups: Int = 1, interleaveWidth: Int = 0)
+    extends Bundle {
   val en = Bool()
   val addr = UInt(addrWidth.W)
+  val groupAddr = AddrGroups.extra(addrGroups, UInt(addrWidth.W))
   val rotate = UInt(rotateWidth.W)
   val fanout = UInt(fanoutWidth.W)
+  val interleave = UInt(interleaveWidth.W)
 }
 
-class ActivationReadCtrl(addrWidth: Int, rotateWidth: Int, fanoutWidth: Int)
-    extends ReadCtrl(addrWidth, rotateWidth, fanoutWidth) {
+class ActivationReadCtrl(
+  addrWidth: Int, rotateWidth: Int, fanoutWidth: Int, addrGroups: Int = 1, interleaveWidth: Int = 0)
+    extends ReadCtrl(addrWidth, rotateWidth, fanoutWidth, addrGroups, interleaveWidth) {
   // val shiftIn = Bool() // line buffer disabled, see ActivationReadSlot
 }
 
-class WriteCtrl(addrWidth: Int) extends Bundle {
+class WriteCtrl(addrWidth: Int, addrGroups: Int = 1) extends Bundle {
   val en = Bool()
   val addr = UInt(addrWidth.W)
+  val groupAddr = AddrGroups.extra(addrGroups, UInt(addrWidth.W))
 }
 
-class WeightWriteCtrl(addrWidth: Int, transposerIndexWidth: Int) extends WriteCtrl(addrWidth) {
+class BufferWriteCtrl(addrWidth: Int, sw: LaneSwitchConfig, addrGroups: Int)
+    extends WriteCtrl(addrWidth, addrGroups) {
+  val partial = Bool()
+  val rotate = UInt(sw.rotateWidth.W)
+  val fanout = UInt(sw.fanoutWidth.W)
+  val interleave = UInt(sw.interleaveWidth.W)
+}
+
+class WeightWriteCtrl(addrWidth: Int, transposerIndexWidth: Int, sw: LaneSwitchConfig, addrGroups: Int)
+    extends BufferWriteCtrl(addrWidth, sw, addrGroups) {
   val fromRequantizer = Bool()
   val transposed = Bool()
   val column = UInt(transposerIndexWidth.W)
@@ -172,7 +238,8 @@ class TransposerCtrl(indexWidth: Int) extends Bundle {
   val row = UInt(indexWidth.W)
 }
 
-class ActivationWriteCtrl(addrWidth: Int) extends WriteCtrl(addrWidth) {
+class ActivationWriteCtrl(addrWidth: Int, sw: LaneSwitchConfig, addrGroups: Int)
+    extends BufferWriteCtrl(addrWidth, sw, addrGroups) {
   val fromRequantizer = Bool()
 }
 
@@ -180,9 +247,14 @@ class WritePortCtrl(addrWidth: Int) extends WriteCtrl(addrWidth) {
   val slot = Bool()
 }
 
-class AccWriteCtrl(addrWidth: Int) extends Bundle {
+class AccWriteCtrl(addrWidth: Int, rotateWidth: Int, fanoutWidth: Int, interleaveWidth: Int, addrGroups: Int = 1)
+    extends Bundle {
   val addr = UInt(addrWidth.W)
+  val groupAddr = AddrGroups.extra(addrGroups, UInt(addrWidth.W))
   val accumulate = Bool()
+  val rotate = UInt(rotateWidth.W)
+  val fanout = UInt(fanoutWidth.W)
+  val interleave = UInt(interleaveWidth.W)
 }
 
 // programLength: how many MicroWords the program store holds.
@@ -234,25 +306,40 @@ class DecoderIO(cfg: DecoderConfig) extends Bundle {
     cfg.weightBuffer.sram.addrWidth,
     cfg.weightBuffer.laneSwitch.rotateWidth,
     cfg.weightBuffer.laneSwitch.fanoutWidth,
+    cfg.weightBuffer.addrGroups,
+    cfg.weightBuffer.laneSwitch.interleaveWidth,
   ))
-  val wbWrite = Output(new WeightWriteCtrl(cfg.weightBuffer.sram.addrWidth, cfg.transposerIndexWidth))
+  val wbWrite = Output(
+    new WeightWriteCtrl(cfg.weightBuffer.sram.addrWidth, cfg.transposerIndexWidth, cfg.weightBuffer.writeSwitch,
+      cfg.weightBuffer.addrGroups))
   val weightPort = Output(new WritePortCtrl(cfg.weightPortAddrWidth))
-  val abWrite = Output(new ActivationWriteCtrl(cfg.activationBuffer.sram.addrWidth))
+  val abWrite = Output(new ActivationWriteCtrl(cfg.activationBuffer.sram.addrWidth, cfg.activationBuffer.writeSwitch,
+    cfg.activationBuffer.addrGroups))
   val abRead = Output(new ActivationReadCtrl(
     cfg.activationBuffer.sram.addrWidth,
     cfg.activationBuffer.laneSwitch.rotateWidth,
     cfg.activationBuffer.laneSwitch.fanoutWidth,
+    cfg.activationBuffer.addrGroups,
+    cfg.activationBuffer.laneSwitch.interleaveWidth,
   ))
   val weightSelect = Output(Bool())
   val requantParamSet = Output(UInt(cfg.requantSetWidth.W))
   val transposer = Output(new TransposerCtrl(cfg.transposerIndexWidth))
   val softmax = Output(new SoftmaxSlot(cfg.softmaxLanesWidth, cfg.softmaxStatWidth, cfg.softmaxRowBeats))
   val residual = Output(new ResidualSlot(cfg.residualSetWidth))
-  val accWrite = Output(new AccWriteCtrl(cfg.accumulator.addrWidth))
+  val accWrite = Output(new AccWriteCtrl(
+    cfg.accumulator.addrWidth,
+    cfg.accumulator.writeSwitch.rotateWidth,
+    cfg.accumulator.writeSwitch.fanoutWidth,
+    cfg.accumulator.writeSwitch.interleaveWidth,
+    cfg.accumulator.addrGroups,
+  ))
   val accRead = Output(new ReadCtrl(
     cfg.accumulator.addrWidth,
     cfg.accumulator.laneSwitch.rotateWidth,
     cfg.accumulator.laneSwitch.fanoutWidth,
+    cfg.accumulator.addrGroups,
+    cfg.accumulator.laneSwitch.interleaveWidth,
   ))
 }
 
@@ -301,11 +388,17 @@ class Decoder(cfg: DecoderConfig) extends Module {
     base + offset
   }
 
+  // the other address groups' rows, each advancing by its own stride
+  private def resolveGroups(slots: Option[Vec[AddrSlot]], addrs: Option[Vec[UInt]]): Unit =
+    for (s <- slots; a <- addrs; (si, ai) <- s.zip(a)) ai := strided(si.addr, si.addrStride)
+
   private def resolveRead(slot: ReadSlot, ctrl: ReadCtrl): Unit = {
     ctrl.en := running && slot.en
     ctrl.addr := strided(slot.addr, slot.addrStride)
+    resolveGroups(slot.groupAddr, ctrl.groupAddr)
     ctrl.rotate := strided(slot.rotate, slot.rotateStride)
     ctrl.fanout := slot.fanout
+    ctrl.interleave := slot.interleave
   }
 
   resolveRead(word.wbRead, io.wbRead)
@@ -316,9 +409,18 @@ class Decoder(cfg: DecoderConfig) extends Module {
   private def resolveWrite(slot: WriteSlot, ctrl: WriteCtrl): Unit = {
     ctrl.en := running && slot.en
     ctrl.addr := strided(slot.addr, slot.addrStride)
+    resolveGroups(slot.groupAddr, ctrl.groupAddr)
   }
 
-  resolveWrite(word.wbWrite, io.wbWrite)
+  private def resolveBufferWrite(slot: BufferWriteSlot, ctrl: BufferWriteCtrl): Unit = {
+    resolveWrite(slot, ctrl)
+    ctrl.partial := slot.partial
+    ctrl.rotate := strided(slot.rotate, slot.rotateStride)
+    ctrl.fanout := slot.fanout
+    ctrl.interleave := slot.interleave
+  }
+
+  resolveBufferWrite(word.wbWrite, io.wbWrite)
   io.wbWrite.fromRequantizer := word.wbWrite.fromRequantizer
   io.wbWrite.transposed := word.wbWrite.transposed
   io.wbWrite.column := strided(word.wbWrite.column, word.wbWrite.columnStride)
@@ -333,7 +435,7 @@ class Decoder(cfg: DecoderConfig) extends Module {
   }
   io.transposer.capture := running && word.transposer.capture
   io.transposer.row := strided(word.transposer.row, word.transposer.rowStride)
-  resolveWrite(word.abWrite, io.abWrite)
+  resolveBufferWrite(word.abWrite, io.abWrite)
   io.abWrite.fromRequantizer := word.abWrite.fromRequantizer
   resolveWrite(word.weightPort, io.weightPort)
   io.weightPort.slot := word.weightPort.slot
@@ -342,5 +444,9 @@ class Decoder(cfg: DecoderConfig) extends Module {
   io.requantParamSet := Mux(running, word.requant.paramSet, 0.U)
 
   io.accWrite.addr := strided(word.accWrite.addr, word.accWrite.addrStride)
+  resolveGroups(word.accWrite.groupAddr, io.accWrite.groupAddr)
+  io.accWrite.rotate := strided(word.accWrite.rotate, word.accWrite.rotateStride)
+  io.accWrite.fanout := word.accWrite.fanout
+  io.accWrite.interleave := word.accWrite.interleave
   io.accWrite.accumulate := running && word.accWrite.accumulate
 }

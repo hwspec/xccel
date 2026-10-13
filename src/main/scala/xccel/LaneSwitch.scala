@@ -12,10 +12,15 @@ import chisel3.util._
 //   - rotate (dynamic, decoder-driven): rotates the input lanes before
 //     assignment, so the active window can start anywhere -- e.g.
 //     selecting which resident tile is active.
-//   - fanout (dynamic, decoder-driven): log2 of how many consecutive
-//     output lanes share one input group. 0 = unicast (every output lane
-//     gets a distinct group), log2Ceil(numOut) = broadcast (every output
-//     lane shares the same group), in between = multicast.
+//   - fanout (dynamic, decoder-driven): log2 of how many output lanes
+//     share one input group. 0 = unicast (every output lane gets a
+//     distinct group), log2Ceil(numOut) = broadcast (every output lane
+//     shares the same group), in between = multicast.
+//   - interleave (dynamic, decoder-driven, built with fanout): how a
+//     multicast lays out its copies. 0 = grouped, each group repeated over
+//     2^fanout consecutive output lanes (r0 r0 r1 r1); 1 = interleaved, the
+//     first ceil(numOut / 2^fanout) groups repeated as a whole (r0 r1 r0 r1),
+//     e.g. one narrow tile replicated across several arrays.
 //   - maxFanout (structural, compile-time): the largest fanout
 //     built; None = log2Ceil(numOut) (up to broadcast), Some(0) = unicast
 //     only (a zero-width fanout, no group muxes).
@@ -48,20 +53,29 @@ case class LaneSwitchConfig(
   )
   // fanout ranges 0..fanoutLimit inclusive (unicast..broadcast by default)
   val fanoutWidth: Int = log2Ceil(fanoutLimit + 1)
+  // grouped / interleaved multicast select, only with a multicast built
+  val interleaveWidth: Int = if (fanoutLimit > 0) 1 else 0
 }
 
 object LaneSwitch {
-  def connect(cfg: LaneSwitchConfig, in: Vec[UInt], rotate: UInt, fanout: UInt): Vec[UInt] = {
+  def connect(cfg: LaneSwitchConfig, in: Vec[UInt], rotate: UInt, fanout: UInt, interleave: UInt): Vec[UInt] = {
     val rotated = BarrelShifter.rotateLeft(in, rotate)
-    // output lane j takes group j >> fanout. fanout only ranges over
+    // output lane j takes group j >> fanout (grouped) or j mod
+    // ceil(numOut / 2^fanout) (interleaved). fanout only ranges over
     // 0..maxFanout (any larger value acts as maxFanout), so each output lane
     // selects among those few static groups instead of indexing every input
-    // lane (numOut x maxFanout muxes, not numOut x numIn)
+    // lane (numOut x 2 maxFanout muxes, not numOut x numIn)
     val maxFanout = cfg.fanoutLimit
     VecInit((0 until cfg.numOut).map { j =>
-      def group(g: Int): UInt = {
-        val base = (j >> g) * cfg.inPerOut
+      def groupAt(k: Int): UInt = {
+        val base = k * cfg.inPerOut
         Cat((0 until cfg.inPerOut).reverse.map(i => rotated(base + i)))
+      }
+      def group(g: Int): UInt = {
+        val grouped = j >> g
+        val interleaved = j % ((cfg.numOut + (1 << g) - 1) >> g)
+        if (grouped == interleaved) groupAt(grouped)
+        else Mux(interleave(0), groupAt(interleaved), groupAt(grouped))
       }
       if (maxFanout == 0) group(0)
       else MuxLookup(fanout, group(maxFanout))((0 until maxFanout).map(g => g.U -> group(g)))

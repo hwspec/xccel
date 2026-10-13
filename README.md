@@ -19,7 +19,7 @@ The compute unit defines only the input size and output size. Therefore, you can
 
 ![compute unit](./compute.png)
 
-## Lane Connectivity
+## Taxonomy of Lane Connectivity and Dataflow
 
 These four **static** connectivities between lanes (i.e., how to wire lanes between each element) are possible.
 
@@ -32,6 +32,7 @@ These four **static** connectivities between lanes (i.e., how to wire lanes betw
 - N:M
   - one input/output lanes have several wire
 
+These connectivities are implemented by addrGroups. The banks are split into groups of consecutive banks, each with its own row address for reads and writes, so one beat can gather words from different rows and one write can scatter them (1 = one address for the whole row).
 Besides, SRAM macros can take several patterns of ports including 1rw, 1r1w, and 2rw.
 
 For **dynamic** routing (i.e., how to pass data on the lane at runtime), including unicast, multicast, and broadcast, are implemented.
@@ -39,6 +40,15 @@ For **dynamic** routing (i.e., how to pass data on the lane at runtime), includi
 - rotate: cyclic left rotation of the input lanes (window select), implemented by a barrel shifter between components (e.g., interface between SRAM and systolic array mesh)
 - fanout: log2 of how many consecutive output lanes share one group of input lanes (e.g., broadcasting: each mesh takes the same data loaded from a single address)
   - 0: unicast, 1 <= N < log2Ceil(numOut): multicast, log2Ceil(numOut): broadcast
+- interleave: how a multicast lays out its copies: 0 = grouped (`r0 r0 r1 r1`), 1 = interleaved, a whole tile repeated (`r0 r1 r0 r1`)
+
+This is the classification of existing accelerators based on Xccel's lane taxonomy.
+
+- Gemmini (1:N, unicast)
+    - Each bank has dimention-sized rows and feeds it to PEs
+- Eyeriss v2 (N:1, unicast/multicast/broadcast)
+- Groq (rotate)
+    - SXM moves data across lanes
 
 ![LaneSwitch](./laneswitch.png)
 
@@ -60,6 +70,7 @@ To realize deterministic dataflow architecture, Xccel adopts the horizontal micr
 |              | rotate          | UInt(wbRotateWidth.W)                          |
 |              | rotateStride    | UInt(wbRotateWidth.W)                          |
 |              | fanout          | UInt(wbFanoutWidth.W)                          |
+|              | interleave      | UInt(wbInterleaveWidth.W)                      |
 | wbWrite      | en              | Bool                                           |
 |              | addr            | UInt(wbAddrWidth.W)                            |
 |              | addrStride      | UInt(wbAddrWidth.W)                            |
@@ -81,16 +92,22 @@ To realize deterministic dataflow architecture, Xccel adopts the horizontal micr
 |              | rotate          | UInt(abRotateWidth.W)                          |
 |              | rotateStride    | UInt(abRotateWidth.W)                          |
 |              | fanout          | UInt(abFanoutWidth.W)                          |
+|              | interleave      | UInt(abInterleaveWidth.W)                      |
 | compute      | weightSelect    | Bool                                           |
 | accWrite     | addr            | UInt(accAddrWidth.W)                           |
 |              | addrStride      | UInt(accAddrWidth.W)                           |
 |              | accumulate      | Bool                                           |
+|              | rotate          | UInt(accWriteRotateWidth.W)                    |
+|              | rotateStride    | UInt(accWriteRotateWidth.W)                    |
+|              | fanout          | UInt(accWriteFanoutWidth.W)                    |
+|              | interleave      | UInt(accWriteInterleaveWidth.W)                |
 | accRead      | en              | Bool                                           |
 |              | addr            | UInt(accAddrWidth.W)                           |
 |              | addrStride      | UInt(accAddrWidth.W)                           |
 |              | rotate          | UInt(accRotateWidth.W)                         |
 |              | rotateStride    | UInt(accRotateWidth.W)                         |
 |              | fanout          | UInt(accFanoutWidth.W)                         |
+|              | interleave      | UInt(accInterleaveWidth.W)                     |
 | requant      | paramSet        | UInt(requantSetWidth.W)                        |
 | transposer   | capture         | Bool                                           |
 |              | row             | UInt(transposerIndexWidth.W)                   |

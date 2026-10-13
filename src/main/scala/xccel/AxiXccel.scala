@@ -100,6 +100,14 @@ case class XccelModuleParams(
   wb_max_fanout: Int,
   ab_max_fanout: Int,
   acc_max_fanout: Int,
+  // independent row addresses per buffer: banks / addr_groups consecutive
+  // banks share one (1: one address for the whole row)
+  wb_addr_groups: Int = 1,
+  ab_addr_groups: Int = 1,
+  acc_addr_groups: Int = 1,
+  // Accumulator row = cols banks x acc_words_per_bank words (> 1: several
+  // result beats per row, placed by the accWrite rotate)
+  acc_words_per_bank: Int = 1,
 ) extends AxiModuleParams with AxiModuleDefParams {
   val moduleName = "Xccel"
 
@@ -120,13 +128,13 @@ case class XccelModuleParams(
       WeightBufferConfig(cu, numBanks = cols, wordsPerBank = wb_words_per_bank, tiles = wb_rows / rows,
         readLatency = wb_read_latency, writeLatency = wb_write_latency, portType = portType(wb_port_type),
         weightLanes = if (compute_arrays > 1 && compute_wide_weights) compute_arrays * cols else 0,
-        maxFanout = maxFanout(wb_max_fanout)),
+        maxFanout = maxFanout(wb_max_fanout), addrGroups = wb_addr_groups),
       ActivationBufferConfig(cu, numBanks = rows, wordsPerBank = 1, depth = ab_rows,
         readLatency = ab_read_latency, writeLatency = ab_write_latency, portType = portType(ab_port_type),
-        maxFanout = maxFanout(ab_max_fanout)),
-      AccumulatorConfig(cu, numBanks = cols, wordsPerBank = 1, depth = acc_rows,
+        maxFanout = maxFanout(ab_max_fanout), addrGroups = ab_addr_groups),
+      AccumulatorConfig(cu, numBanks = cols, wordsPerBank = acc_words_per_bank, depth = acc_rows,
         readLatency = acc_read_latency, writeLatency = acc_write_latency, rowBanks = acc_row_banks,
-        maxFanout = maxFanout(acc_max_fanout)),
+        maxFanout = maxFanout(acc_max_fanout), addrGroups = acc_addr_groups),
       requantizedWidth = requantized_width,
       programLength = program_length,
       maxRunLength = max_run_length,

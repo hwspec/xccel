@@ -122,6 +122,316 @@ class XccelTest extends AnyFlatSpec with ChiselScalatestTester {
     }
   }
 
+  it should "gather operands and scatter results with per-group bank addresses (addrGroups = 2)" in {
+    // the matmul above, with each sample split across two ActivationBuffer
+    // rows (banks 0-1 from one row, banks 2-3 from another) and the two
+    // result columns written to different Accumulator rows
+    val cu = ComputeUnitConfig(numInputs = 4, numOutputs = 2, inputWidth = 8, weightWidth = 8, outputWidth = 20)
+    val wbCfg = WeightBufferConfig(cu, numBanks = cu.numOutputs, wordsPerBank = 1, tiles = 1,
+      readLatency = 2, writeLatency = 2, addrGroups = 2)
+    val abCfg = ActivationBufferConfig(cu, numBanks = cu.numInputs, wordsPerBank = 1, depth = 4,
+      readLatency = 1, writeLatency = 1, addrGroups = 2)
+    val accCfg = AccumulatorConfig(cu, numBanks = cu.numOutputs, wordsPerBank = 1, depth = 2,
+      readLatency = 2, writeLatency = 2, addrGroups = 2)
+    val cfg = XccelConfig(cu, wbCfg, abCfg, accCfg, requantizedWidth = cu.outputWidth,
+      programLength = 5, maxRunLength = 4)
+
+    test(new Xccel(cfg)) { c =>
+      val weightRows = Seq(Seq(1, 2), Seq(3, 4), Seq(5, 6), Seq(7, 8))
+      // sample 0 = [1, 1, 1, 1]: row 0 lanes 0-1, row 1 lanes 2-3;
+      // sample 1 = [2, 0, -1, 1]: row 2 lanes 0-1, row 3 lanes 2-3
+      val abRows = Seq(Seq(1, 1, 9, 9), Seq(9, 9, 1, 1), Seq(2, 0, 7, 7), Seq(7, 7, -1, 1))
+      // results [16, 20] and [4, 6]; column 1 is written to rows 1, 0
+      val expected = Seq(Seq(16, 6), Seq(4, 20))
+
+      c.io.start.poke(false.B)
+      c.io.progWriteEn.poke(false.B)
+      c.io.requantParamWriteEn.poke(false.B)
+      c.io.softmaxParamWriteEn.poke(false.B)
+      c.io.residualParamWriteEn.poke(false.B)
+      c.io.accReadParamSet.poke(0.U)
+      c.io.accReadEn.poke(false.B)
+
+      // host loads address whole rows (every group at the host's row)
+      c.io.wbWriteEn.poke(true.B)
+      for ((row, r) <- weightRows.zipWithIndex) {
+        c.io.wbWriteAddr.poke(r.U)
+        for ((v, i) <- row.zipWithIndex) c.io.wbWriteData(i).poke(toU(v, cu.weightWidth))
+        c.clock.step()
+      }
+      c.io.wbWriteEn.poke(false.B)
+      c.io.abWriteEn.poke(true.B)
+      for ((s, r) <- abRows.zipWithIndex) {
+        c.io.abWriteAddr.poke(r.U)
+        for ((v, i) <- s.zipWithIndex) c.io.abWriteData(i).poke(toU(v, cu.inputWidth))
+        c.clock.step()
+      }
+      c.io.abWriteEn.poke(false.B)
+      c.clock.step(wbCfg.writeLatency)
+
+      val p = new MicroProgramLoader(c.clock, c.io.progWriteEn, c.io.progWriteAddr, c.io.progWriteData)
+      def wbRows(w: MicroWord, base: Int): Unit = {
+        w.wbRead.en.poke(true.B)
+        w.wbRead.addr.poke(base.U)
+        w.wbRead.addrStride.poke(1.U)
+        w.wbRead.groupAddr.get(0).addr.poke(base.U)
+        w.wbRead.groupAddr.get(0).addrStride.poke(1.U)
+      }
+      p.word(cycles = 2)(w => wbRows(w, 0))
+      p.word(cycles = 2) { w =>
+        wbRows(w, 2)
+        w.weightPort.en.poke(true.B)
+        w.weightPort.addrStride.poke(1.U)
+      }
+      // samples: group 0 reads rows 0, 2 and group 1 rows 1, 3
+      p.word(cycles = 2) { w =>
+        w.abRead.en.poke(true.B)
+        w.abRead.addrStride.poke(2.U)
+        w.abRead.groupAddr.get(0).addr.poke(1.U)
+        w.abRead.groupAddr.get(0).addrStride.poke(2.U)
+        w.weightPort.en.poke(true.B)
+        w.weightPort.addr.poke(2.U)
+        w.weightPort.addrStride.poke(1.U)
+      }
+      p.word(cycles = 4)()
+      // column 0 to rows 0, 1 and column 1 to rows 1, 0
+      p.word(cycles = 2, halt = true) { w =>
+        w.accWrite.addrStride.poke(1.U)
+        w.accWrite.groupAddr.get(0).addr.poke(1.U)
+        w.accWrite.groupAddr.get(0).addrStride.poke(MicroProgramLoader.minusOne(accCfg.addrWidth))
+      }
+      p.done()
+
+      c.io.start.poke(true.B)
+      c.clock.step()
+      c.io.start.poke(false.B)
+      var cycles = 0
+      while (c.io.running.peek().litToBoolean) {
+        c.clock.step()
+        cycles += 1
+        assert(cycles < 64, "program never halted")
+      }
+      assert(cycles == 12)
+      c.clock.step(accCfg.commitLatency)
+
+      // host drains read whole rows
+      for ((exp, r) <- expected.zipWithIndex) {
+        c.io.accReadAddr.poke(r.U)
+        c.io.accReadEn.poke(true.B)
+        c.clock.step(accCfg.readLatency)
+        c.io.accumOut.valid.expect(true.B)
+        for ((v, i) <- exp.zipWithIndex) c.io.accumOut.bits(i).expect(toU(v, cu.outputWidth))
+      }
+      c.io.accReadEn.poke(false.B)
+    }
+  }
+
+  it should "pack two result beats into one wider Accumulator row with the accWrite rotate, and drain both halves" in {
+    // the first matmul again; Accumulator rows hold 4 words (2 beats), and
+    // the two samples' results land side by side in row 0
+    val cu = ComputeUnitConfig(numInputs = 4, numOutputs = 2, inputWidth = 8, weightWidth = 8, outputWidth = 20)
+    val wbCfg = WeightBufferConfig(cu, numBanks = cu.numOutputs, wordsPerBank = 1, tiles = 1,
+      readLatency = 2, writeLatency = 2)
+    val abCfg = ActivationBufferConfig(cu, numBanks = cu.numInputs, wordsPerBank = 1, depth = 2,
+      readLatency = 1, writeLatency = 1)
+    val accCfg = AccumulatorConfig(cu, numBanks = cu.numOutputs, wordsPerBank = 2, depth = 2,
+      readLatency = 2, writeLatency = 2)
+    val cfg = XccelConfig(cu, wbCfg, abCfg, accCfg, requantizedWidth = cu.outputWidth,
+      programLength = 8, maxRunLength = 8)
+
+    test(new Xccel(cfg)) { c =>
+      val weightRows = Seq(Seq(1, 2), Seq(3, 4), Seq(5, 6), Seq(7, 8))
+      val samples = Seq(Seq(1, 1, 1, 1), Seq(2, 0, -1, 1))
+
+      c.io.start.poke(false.B)
+      c.io.progWriteEn.poke(false.B)
+      c.io.requantParamWriteEn.poke(false.B)
+      c.io.softmaxParamWriteEn.poke(false.B)
+      c.io.residualParamWriteEn.poke(false.B)
+      c.io.accReadParamSet.poke(0.U)
+      c.io.accReadEn.poke(false.B)
+      c.io.wbWriteEn.poke(true.B)
+      for ((row, r) <- weightRows.zipWithIndex) {
+        c.io.wbWriteAddr.poke(r.U)
+        for ((v, i) <- row.zipWithIndex) c.io.wbWriteData(i).poke(toU(v, cu.weightWidth))
+        c.clock.step()
+      }
+      c.io.wbWriteEn.poke(false.B)
+      c.io.abWriteEn.poke(true.B)
+      for ((s, r) <- samples.zipWithIndex) {
+        c.io.abWriteAddr.poke(r.U)
+        for ((v, i) <- s.zipWithIndex) c.io.abWriteData(i).poke(toU(v, cu.inputWidth))
+        c.clock.step()
+      }
+      c.io.abWriteEn.poke(false.B)
+      c.clock.step(wbCfg.writeLatency)
+
+      val p = new MicroProgramLoader(c.clock, c.io.progWriteEn, c.io.progWriteAddr, c.io.progWriteData)
+      p.word(cycles = 2) { w =>
+        w.wbRead.en.poke(true.B)
+        w.wbRead.addrStride.poke(1.U)
+      }
+      p.word(cycles = 2) { w =>
+        w.wbRead.en.poke(true.B)
+        w.wbRead.addr.poke(2.U)
+        w.wbRead.addrStride.poke(1.U)
+        w.weightPort.en.poke(true.B)
+        w.weightPort.addrStride.poke(1.U)
+      }
+      p.word(cycles = 2) { w =>
+        w.abRead.en.poke(true.B)
+        w.abRead.addrStride.poke(1.U)
+        w.weightPort.en.poke(true.B)
+        w.weightPort.addr.poke(2.U)
+        w.weightPort.addrStride.poke(1.U)
+      }
+      p.word(cycles = 4)()
+      // t10-11: both results to row 0, at words 0 and 2 (rotate 0, then 4 - 2)
+      p.word(cycles = 2) { w =>
+        w.accWrite.rotateStride.poke(2.U)
+      }
+      p.word(cycles = accCfg.commitLatency)()
+      // drain row 0's two halves (read rotate 0, 2)
+      p.word(cycles = 2) { w =>
+        w.accRead.en.poke(true.B)
+        w.accRead.rotateStride.poke(2.U)
+      }
+      p.word(cycles = 8, halt = true)()
+      p.done()
+
+      c.io.start.poke(true.B)
+      c.clock.step()
+      c.io.start.poke(false.B)
+      val drained = scala.collection.mutable.ArrayBuffer[Seq[BigInt]]()
+      var cycles = 0
+      while (c.io.running.peek().litToBoolean) {
+        if (c.io.accumOut.valid.peek().litToBoolean) drained += c.io.accumOut.bits.map(_.peek().litValue).toSeq
+        c.clock.step()
+        cycles += 1
+        assert(cycles < 64, "program never halted")
+      }
+      val expected = Seq(Seq(16, 20), Seq(4, 6)).map(_.map(v => toU(v, cu.outputWidth).litValue))
+      assert(drained.toSeq == expected, s"drained $drained")
+    }
+  }
+
+  it should "place a Requantizer beat in the middle of an ActivationBuffer row with a partial abWrite" in {
+    // a 2-lane beat into a 4-word row: words 1-2 replaced, words 0 and 3 kept
+    val cu = ComputeUnitConfig(numInputs = 4, numOutputs = 2, inputWidth = 8, weightWidth = 8, outputWidth = 20)
+    val wbCfg = WeightBufferConfig(cu, numBanks = cu.numOutputs, wordsPerBank = 1, tiles = 1,
+      readLatency = 2, writeLatency = 2)
+    val abCfg = ActivationBufferConfig(cu, numBanks = cu.numInputs, wordsPerBank = 1, depth = 2,
+      readLatency = 1, writeLatency = 1, portType = BankPortType.OneR1W)
+    val accCfg = AccumulatorConfig(cu, numBanks = cu.numOutputs, wordsPerBank = 1, depth = 2,
+      readLatency = 2, writeLatency = 2)
+    val cfg = XccelConfig(cu, wbCfg, abCfg, accCfg, requantizedWidth = cu.inputWidth,
+      programLength = 16, maxRunLength = 8)
+    assert(cfg.feedback)
+
+    test(new Xccel(cfg)) { c =>
+      // out0 = a0 + 16 a1, out1 = a2 + 16 a3: both passes see all four words
+      val weightRows = Seq(Seq(1, 0), Seq(16, 0), Seq(0, 1), Seq(0, 16))
+      // row 0: x, giving the beat [5, 6]; row 1: the row the beat goes into
+      val abRows = Seq(Seq(5, 0, 6, 0), Seq(1, 2, 3, 4))
+
+      c.io.start.poke(false.B)
+      c.io.progWriteEn.poke(false.B)
+      c.io.softmaxParamWriteEn.poke(false.B)
+      c.io.residualParamWriteEn.poke(false.B)
+      c.io.accReadParamSet.poke(0.U)
+      c.io.accReadEn.poke(false.B)
+      // Requantizer set 0: identity, int8
+      c.io.requantParamWriteEn.poke(true.B)
+      c.io.requantParamWriteSet.poke(0.U)
+      for (i <- 0 until cu.numOutputs) {
+        c.io.requantParamWriteData.bias(i).poke(0.S)
+        c.io.requantParamWriteData.mult(i).poke(1.U)
+        c.io.requantParamWriteData.shift(i).poke(0.U)
+      }
+      c.io.requantParamWriteData.lo.poke(-128.S)
+      c.io.requantParamWriteData.hi.poke(127.S)
+      c.clock.step()
+      c.io.requantParamWriteEn.poke(false.B)
+      c.io.wbWriteEn.poke(true.B)
+      for ((row, r) <- weightRows.zipWithIndex) {
+        c.io.wbWriteAddr.poke(r.U)
+        for ((v, i) <- row.zipWithIndex) c.io.wbWriteData(i).poke(toU(v, cu.weightWidth))
+        c.clock.step()
+      }
+      c.io.wbWriteEn.poke(false.B)
+      c.io.abWriteEn.poke(true.B)
+      for ((row, r) <- abRows.zipWithIndex) {
+        c.io.abWriteAddr.poke(r.U)
+        for ((v, i) <- row.zipWithIndex) c.io.abWriteData(i).poke(toU(v, cu.inputWidth))
+        c.clock.step()
+      }
+      c.io.abWriteEn.poke(false.B)
+      c.clock.step(wbCfg.writeLatency)
+
+      val p = new MicroProgramLoader(c.clock, c.io.progWriteEn, c.io.progWriteAddr, c.io.progWriteData)
+      p.word(cycles = 2) { w => // t0-1
+        w.wbRead.en.poke(true.B)
+        w.wbRead.addrStride.poke(1.U)
+      }
+      p.word(cycles = 2) { w => // t2-3
+        w.wbRead.en.poke(true.B)
+        w.wbRead.addr.poke(2.U)
+        w.wbRead.addrStride.poke(1.U)
+        w.weightPort.en.poke(true.B)
+        w.weightPort.addrStride.poke(1.U)
+      }
+      p.word(cycles = 2) { w => // t4-5: x (twice), the last weight rows land
+        w.abRead.en.poke(true.B)
+        w.weightPort.en.poke(true.B)
+        w.weightPort.addr.poke(2.U)
+        w.weightPort.addrStride.poke(1.U)
+      }
+      p.word(cycles = 4)()
+      p.word(cycles = 2)(_ => ()) // t10-11: results to Accumulator row 0
+      p.word(cycles = 4)()
+      p.word(cycles = 1) { w => // t16: drain row 0
+        w.accRead.en.poke(true.B)
+      }
+      p.word(cycles = 1)()
+      p.word(cycles = 1) { w => // t18: its beat to ActivationBuffer row 1, at word 1
+        w.abWrite.en.poke(true.B)
+        w.abWrite.addr.poke(1.U)
+        w.abWrite.fromRequantizer.poke(true.B)
+        w.abWrite.partial.poke(true.B)
+        w.abWrite.rotate.poke(3.U) // 4 - 1
+      }
+      p.word(cycles = 3)()
+      p.word(cycles = 1) { w => // t22: row 1 through the array
+        w.abRead.en.poke(true.B)
+        w.abRead.addr.poke(1.U)
+      }
+      p.word(cycles = 5)()
+      p.word(cycles = 1, halt = true) { w => // t28: its result to Accumulator row 1
+        w.accWrite.addr.poke(1.U)
+      }
+      p.done()
+
+      c.io.start.poke(true.B)
+      c.clock.step()
+      c.io.start.poke(false.B)
+      var cycles = 0
+      while (c.io.running.peek().litToBoolean) {
+        c.clock.step()
+        cycles += 1
+        assert(cycles < 64, "program never halted")
+      }
+      c.clock.step(accCfg.commitLatency)
+
+      // row 1 is [1, 5, 6, 4]: [1 + 16 * 5, 6 + 16 * 4]
+      c.io.accReadAddr.poke(1.U)
+      c.io.accReadEn.poke(true.B)
+      c.clock.step(accCfg.readLatency)
+      c.io.accumOut.valid.expect(true.B)
+      for ((v, i) <- Seq(81, 70).zipWithIndex) c.io.accumOut.bits(i).expect(toU(v, cfg.requantizedWidth))
+      c.io.accReadEn.poke(false.B)
+    }
+  }
+
   // ---- 3x3 conv, three ways --------------------------------------------
   // A stride-1, unpadded 3x3 conv (one C_in tile, one C_out tile) run on the
   // same hardware as accumulating kn2row (full input width or valid outputs

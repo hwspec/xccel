@@ -26,6 +26,7 @@ class MicroProgramLoader(clock: Clock, en: Bool, addr: UInt, data: MicroWord) {
 object MicroProgramLoader {
   def clear(d: Data): Unit = d match {
     case b: Bundle => b.elements.values.foreach(clear)
+    case v: Vec[_] => v.foreach(clear)
     case b: Bool   => b.poke(false.B)
     case u: UInt   => u.poke(0.U)
   }

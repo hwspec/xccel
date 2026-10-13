@@ -46,8 +46,14 @@ class WeightBufferSystolicHarness(
   weightBuffer.io.writeAddr := io.wbAddr
   weightBuffer.io.writeEn := io.wbEn && io.wbWen
   weightBuffer.io.wdata := io.wbWdata
+  // whole rows, unmoved
+  weightBuffer.io.wmask.foreach(_ := true.B)
+  weightBuffer.io.writeRotate := 0.U
+  weightBuffer.io.writeFanout := 0.U
+  weightBuffer.io.writeInterleave := 0.U
   weightBuffer.io.rotate := io.wbRotate
   weightBuffer.io.fanout := io.wbFanout
+  weightBuffer.io.interleave := 0.U // grouped multicast only
 
   compute.weightWriteEn := weightBuffer.io.weightOut.valid
   compute.weightWriteData := weightBuffer.io.weightOut.bits
@@ -79,6 +85,7 @@ class WeightBufferTest extends AnyFlatSpec with ChiselScalatestTester {
       for ((row, r) <- rows.zipWithIndex) {
         c.io.writeAddr.poke(r.U)
         c.io.writeEn.poke(true.B)
+        c.io.wmask.foreach(_.poke(true.B))
         for ((v, col) <- row.zipWithIndex) c.io.wdata(col).poke(v.U)
         c.clock.step()
       }
@@ -116,6 +123,7 @@ class WeightBufferTest extends AnyFlatSpec with ChiselScalatestTester {
       for ((row, r) <- rows.zipWithIndex) {
         c.io.writeAddr.poke(r.U)
         c.io.writeEn.poke(true.B)
+        c.io.wmask.foreach(_.poke(true.B))
         for ((v, i) <- row.zipWithIndex) c.io.wdata(i).poke(v.U)
         c.clock.step()
       }
@@ -150,6 +158,7 @@ class WeightBufferTest extends AnyFlatSpec with ChiselScalatestTester {
       for (r <- 0 until cuCfg.numInputs) {
         c.io.writeAddr.poke(r.U)
         c.io.writeEn.poke(true.B)
+        c.io.wmask.foreach(_.poke(true.B))
         val packed = tileA(r) ++ tileB(r) ++ tileC(r)
         for ((v, word) <- packed.zipWithIndex) c.io.wdata(word).poke(v.U)
         c.clock.step()
@@ -182,6 +191,7 @@ class WeightBufferTest extends AnyFlatSpec with ChiselScalatestTester {
 
       c.io.writeAddr.poke(0.U)
       c.io.writeEn.poke(true.B)
+      c.io.wmask.foreach(_.poke(true.B))
       for ((v, i) <- row.zipWithIndex) c.io.wdata(i).poke(v.U)
       c.clock.step()
       c.io.readEn.poke(false.B)
@@ -212,6 +222,7 @@ class WeightBufferTest extends AnyFlatSpec with ChiselScalatestTester {
 
       c.io.writeAddr.poke(0.U)
       c.io.writeEn.poke(true.B)
+      c.io.wmask.foreach(_.poke(true.B))
       for ((v, i) <- row.zipWithIndex) c.io.wdata(i).poke(v.U)
       c.clock.step()
       c.io.readEn.poke(false.B)
@@ -304,6 +315,7 @@ class WeightBufferTest extends AnyFlatSpec with ChiselScalatestTester {
       def write(r: Int, row: Seq[Int]): Unit = {
         c.io.writeAddr.poke(r.U)
         c.io.writeEn.poke(true.B)
+        c.io.wmask.foreach(_.poke(true.B))
         for ((v, i) <- row.zipWithIndex) c.io.wdata(i).poke(v.U)
       }
       def read(r: Int): Seq[BigInt] = {
@@ -337,6 +349,42 @@ class WeightBufferTest extends AnyFlatSpec with ChiselScalatestTester {
       val row1 = read(1)
       if (portType == BankPortType.OneRW) assert(row1 != Seq(BigInt(3), BigInt(4)))
       else assert(row1 == Seq(BigInt(3), BigInt(4)))
+    }
+  }
+
+  "WeightBuffer with address groups" should "read each bank from its own row when every bank is a group" in {
+    val cuCfg = ComputeUnitConfig(numInputs = 2, numOutputs = 4, inputWidth = 8, weightWidth = 8, outputWidth = 20)
+    val cfg = WeightBufferConfig(cuCfg, numBanks = 4, wordsPerBank = 1, tiles = 2,
+      readLatency = 2, writeLatency = 2, portType = BankPortType.OneR1W, addrGroups = 4)
+    test(new WeightBuffer(cfg)) { c =>
+      val rg = c.io.readGroupAddr.get
+      val wg = c.io.writeGroupAddr.get
+      c.io.rotate.poke(0.U)
+      c.io.fanout.poke(0.U)
+      c.io.readEn.poke(false.B)
+
+      // row r holds 10r + bank, written with every group at row r
+      for (r <- 0 until 4) {
+        c.io.writeAddr.poke(r.U)
+        wg.foreach(_.poke(r.U))
+        c.io.writeEn.poke(true.B)
+        c.io.wmask.foreach(_.poke(true.B))
+        for (n <- 0 until 4) c.io.wdata(n).poke((10 * r + n).U)
+        c.clock.step()
+      }
+      c.io.writeEn.poke(false.B)
+      c.clock.step(cfg.writeLatency)
+
+      // a diagonal: bank n from row addrs(n)
+      val addrs = Seq(3, 0, 2, 1)
+      c.io.readAddr.poke(addrs.head.U)
+      for ((g, a) <- rg.zip(addrs.tail)) g.poke(a.U)
+      c.io.readEn.poke(true.B)
+      c.clock.step()
+      c.io.readEn.poke(false.B)
+      c.clock.step(cfg.readLatency - 1)
+      c.io.weightOut.valid.expect(true.B)
+      for ((a, n) <- addrs.zipWithIndex) c.io.weightOut.bits(n).expect((10 * a + n).U)
     }
   }
 }

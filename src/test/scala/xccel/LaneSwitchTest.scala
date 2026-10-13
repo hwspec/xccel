@@ -13,9 +13,10 @@ class LaneSwitchProbe(cfg: LaneSwitchConfig) extends Module {
     val in = Input(Vec(cfg.numIn, UInt(cfg.laneWidth.W)))
     val rotate = Input(UInt(cfg.rotateWidth.W))
     val fanout = Input(UInt(cfg.fanoutWidth.W))
+    val interleave = Input(UInt(cfg.interleaveWidth.W))
     val out = Output(Vec(cfg.numOut, UInt(cfg.outWidth.W)))
   })
-  io.out := LaneSwitch.connect(cfg, io.in, io.rotate, io.fanout)
+  io.out := LaneSwitch.connect(cfg, io.in, io.rotate, io.fanout, io.interleave)
 }
 
 class LaneSwitchTest extends AnyFlatSpec with ChiselScalatestTester {
@@ -147,5 +148,58 @@ class LaneSwitchTest extends AnyFlatSpec with ChiselScalatestTester {
         for (j <- 0 until 8) c.io.out(j).expect((10 + j / 4).U)
       }
     }
+  }
+
+  it should "interleave a multicast: the first numOut / 2^fanout groups repeated as a whole" in {
+    val cfg = LaneSwitchConfig(numIn = 8, numOut = 8, inPerOut = 1, laneWidth = 8)
+    assert(cfg.interleaveWidth == 1)
+    test(new LaneSwitchProbe(cfg)) { c =>
+      for (i <- 0 until 8) c.io.in(i).poke((10 + i).U)
+      c.io.rotate.poke(1.U)
+      c.io.interleave.poke(1.U)
+      // unicast is the same either way
+      c.io.fanout.poke(0.U)
+      for (j <- 0 until 8) c.io.out(j).expect((10 + (j + 1) % 8).U)
+      // 2 copies of a 4-lane tile, 4 copies of a 2-lane tile, broadcast
+      for (g <- 1 to 3) {
+        c.io.fanout.poke(g.U)
+        for (j <- 0 until 8) c.io.out(j).expect((11 + j % (8 >> g)).U)
+      }
+      // grouped again for comparison: r1 r1 r2 r2 ...
+      c.io.interleave.poke(0.U)
+      c.io.fanout.poke(1.U)
+      for (j <- 0 until 8) c.io.out(j).expect((11 + j / 2).U)
+    }
+  }
+
+  it should "interleave with a numOut that is not a power of two (the last copy partial)" in {
+    val cfg = LaneSwitchConfig(numIn = 6, numOut = 6, inPerOut = 1, laneWidth = 8)
+    test(new LaneSwitchProbe(cfg)) { c =>
+      for (i <- 0 until 6) c.io.in(i).poke((10 + i).U)
+      c.io.rotate.poke(0.U)
+      c.io.interleave.poke(1.U)
+      // fanout 1: tile of ceil(6 / 2) = 3 lanes; fanout 2: ceil(6 / 4) = 2
+      // lanes (r0 r1 r0 r1 r0 r1); fanout 3: broadcast
+      for ((g, tile) <- Seq(1 -> 3, 2 -> 2, 3 -> 1)) {
+        c.io.fanout.poke(g.U)
+        for (j <- 0 until 6) c.io.out(j).expect((10 + j % tile).U)
+      }
+    }
+  }
+
+  it should "interleave groups of inPerOut lanes (N:1 with an interleaved multicast)" in {
+    val cfg = LaneSwitchConfig(numIn = 8, numOut = 4, inPerOut = 2, laneWidth = 4)
+    test(new LaneSwitchProbe(cfg)) { c =>
+      for (i <- 0 until 8) c.io.in(i).poke((i + 1).U)
+      c.io.rotate.poke(0.U)
+      c.io.fanout.poke(1.U)
+      c.io.interleave.poke(1.U)
+      // groups (in1, in0) and (in3, in2), repeated
+      for (j <- 0 until 4) c.io.out(j).expect((if (j % 2 == 0) "b0010_0001" else "b0100_0011").U)
+    }
+  }
+
+  it should "build no interleave select with maxFanout = 0" in {
+    assert(LaneSwitchConfig(numIn = 8, numOut = 8, inPerOut = 1, laneWidth = 8, Some(0)).interleaveWidth == 0)
   }
 }

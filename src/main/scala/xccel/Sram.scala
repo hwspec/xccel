@@ -62,8 +62,10 @@ class SramIO(cfg: SramConfig) extends Bundle {
 
 object Sram {
   // Drives one read stream and one write stream onto an Sram's ports,
-  // for any port type, and returns each bank's rdata. `wdata(n)` is bank
-  // n's packed row and `wmask(n)` its write mask. OneRW: both share the
+  // for any port type, and returns each bank's rdata. `readAddr(n)` /
+  // `writeAddr(n)` are bank n's row addresses (the same value in every bank
+  // when the banks act as one wide row), `wdata(n)` its packed row and
+  // `wmask(n)` its write mask. OneRW: both share the
   // bank's single port; a read takes it, so a write in the same cycle is
   // dropped, and with writeLatency > 1 an accepted write takes the port
   // writeLatency - 1 cycles later, when a read requested in that cycle
@@ -73,9 +75,9 @@ object Sram {
   def connectReadWrite(
     cfg: SramConfig,
     io: SramIO,
-    readAddr: UInt,
+    readAddr: Seq[UInt],
     readEn: Bool,
-    writeAddr: UInt,
+    writeAddr: Seq[UInt],
     writeEn: Bool,
     wdata: Seq[UInt],
     wmask: Seq[UInt],
@@ -84,7 +86,7 @@ object Sram {
       cfg.portType match {
         case BankPortType.OneRW =>
           val p = io.ports(n)
-          p.addr := Mux(readEn, readAddr, writeAddr)
+          p.addr := Mux(readEn, readAddr(n), writeAddr(n))
           p.en := readEn || writeEn
           p.wen := !readEn
           p.wdata := wdata(n)
@@ -93,12 +95,12 @@ object Sram {
         case BankPortType.OneR1W | BankPortType.TwoRW =>
           val r = io.ports(2 * n)
           val w = io.ports(2 * n + 1)
-          r.addr := readAddr
+          r.addr := readAddr(n)
           r.en := readEn
           r.wen := false.B
           r.wdata := 0.U
           r.wmask := 0.U
-          w.addr := writeAddr
+          w.addr := writeAddr(n)
           w.en := writeEn
           w.wen := true.B
           w.wdata := wdata(n)

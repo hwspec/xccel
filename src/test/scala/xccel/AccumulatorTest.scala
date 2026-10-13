@@ -172,4 +172,100 @@ class AccumulatorTest extends AnyFlatSpec with ChiselScalatestTester {
       }
     }
   }
+
+  "Accumulator with address groups" should "write, accumulate and drain each group's row in its own row bank" in {
+    val cuCfg = ComputeUnitConfig(numInputs = 1, numOutputs = 4, inputWidth = 8, weightWidth = 8, outputWidth = 20)
+    // rows 0-1 in row bank 0, rows 2-3 in row bank 1; columns 0-1 are
+    // address group 0, columns 2-3 group 1
+    val cfg = AccumulatorConfig(cuCfg, numBanks = 4, wordsPerBank = 1, depth = 4, readLatency = 2, writeLatency = 2,
+      rowBanks = 2, addrGroups = 2)
+    test(new Accumulator(cfg)) { c =>
+      val wg = c.io.writeGroupAddr.get(0)
+      val rg = c.io.readGroupAddr.get(0)
+      c.io.readEn.poke(false.B)
+      c.io.rotate.poke(0.U)
+      c.io.fanout.poke(0.U)
+
+      def beat(a0: Int, a1: Int, accumulate: Boolean, s: Seq[Int]): Unit = {
+        c.io.writeAddr.poke(a0.U)
+        wg.poke(a1.U)
+        c.io.accumulate.poke(accumulate.B)
+        c.io.resultIn.valid.poke(true.B)
+        for ((v, i) <- s.zipWithIndex) c.io.resultIn.bits(i).poke(v.S(cfg.cu.outputWidth.W))
+        c.clock.step()
+        c.io.resultIn.valid.poke(false.B)
+        c.clock.step(cfg.commitLatency)
+      }
+      def drain(a0: Int, a1: Int, expected: Seq[Int]): Unit = {
+        c.io.readAddr.poke(a0.U)
+        rg.poke(a1.U)
+        c.io.readEn.poke(true.B)
+        c.clock.step()
+        c.io.readEn.poke(false.B)
+        c.clock.step(cfg.readLatency - 1)
+        c.io.accOut.valid.expect(true.B)
+        for ((v, i) <- expected.zipWithIndex) c.io.accOut.bits(i).expect(toU(v, cfg.cu.outputWidth))
+      }
+
+      // group 0 -> row 0 (row bank 0), group 1 -> row 3 (row bank 1), and
+      // the other way round
+      beat(0, 3, accumulate = false, Seq(1, 2, 3, 4))
+      beat(3, 0, accumulate = false, Seq(5, 6, 7, 8))
+      // each group's read-modify-write reads its own row in its own row bank
+      beat(0, 3, accumulate = true, Seq(10, 20, 30, -40))
+      drain(0, 3, Seq(11, 22, 33, -36))
+      drain(3, 0, Seq(5, 6, 7, 8))
+    }
+  }
+
+  "Accumulator with a write switch" should "place beats anywhere in a wider row, writing only the words they land on" in {
+    // rows of 4 words (2 banks x 2 words), beats of 2 lanes
+    val cuCfg = ComputeUnitConfig(numInputs = 1, numOutputs = 2, inputWidth = 8, weightWidth = 8, outputWidth = 20)
+    val cfg = AccumulatorConfig(cuCfg, numBanks = 2, wordsPerBank = 2, depth = 2, readLatency = 2, writeLatency = 2)
+    test(new Accumulator(cfg)) { c =>
+      c.io.readEn.poke(false.B)
+      c.io.fanout.poke(0.U)
+      c.io.interleave.poke(0.U)
+
+      def beat(at: Int, accumulate: Boolean, s: Seq[Int], fanout: Int = 0, interleave: Int = 0): Unit = {
+        c.io.writeAddr.poke(0.U)
+        c.io.writeRotate.poke(((cfg.totalWordsPerRow - at) % cfg.totalWordsPerRow).U) // lane 0 -> word `at`
+        c.io.writeFanout.poke(fanout.U)
+        c.io.writeInterleave.poke(interleave.U)
+        c.io.accumulate.poke(accumulate.B)
+        c.io.resultIn.valid.poke(true.B)
+        for ((v, i) <- s.zipWithIndex) c.io.resultIn.bits(i).poke(v.S(cfg.cu.outputWidth.W))
+        c.clock.step()
+        c.io.resultIn.valid.poke(false.B)
+        c.clock.step(cfg.commitLatency)
+      }
+      // the whole row, through the drain switch (rotate = first word)
+      def row(expected: Seq[Int]): Unit =
+        for (at <- Seq(0, 2)) {
+          c.io.readAddr.poke(0.U)
+          c.io.rotate.poke(at.U)
+          c.io.readEn.poke(true.B)
+          c.clock.step()
+          c.io.readEn.poke(false.B)
+          c.clock.step(cfg.readLatency - 1)
+          c.io.accOut.valid.expect(true.B)
+          for (i <- 0 until 2) c.io.accOut.bits(i).expect(toU(expected(at + i), cfg.cu.outputWidth))
+        }
+
+      beat(0, accumulate = false, Seq(1, 2))
+      beat(2, accumulate = false, Seq(3, 4))
+      row(Seq(1, 2, 3, 4))
+      // accumulate into words 2-3 only; words 0-1 keep their value
+      beat(2, accumulate = true, Seq(10, -20))
+      row(Seq(1, 2, 13, -16))
+      // across the row end: lanes 0, 1 -> words 3, 0
+      beat(3, accumulate = false, Seq(7, 8))
+      row(Seq(8, 2, 13, 7))
+      // multicast over the row: grouped (r0 r0 r1 r1), interleaved (r0 r1 r0 r1)
+      beat(0, accumulate = false, Seq(5, 6), fanout = 1)
+      row(Seq(5, 5, 6, 6))
+      beat(0, accumulate = false, Seq(5, 6), fanout = 1, interleave = 1)
+      row(Seq(5, 6, 5, 6))
+    }
+  }
 }

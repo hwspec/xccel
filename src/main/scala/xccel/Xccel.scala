@@ -119,6 +119,26 @@ class XccelIO(cfg: XccelConfig) extends Bundle {
 class Xccel(cfg: XccelConfig) extends Module {
   val io = IO(new XccelIO(cfg))
 
+  // The other address groups of a buffer port (AddrGroups): the program's
+  // own group addresses while running; the host addresses a whole row, so
+  // before start every group takes the host's address.
+  private def connectGroups(dst: Option[Vec[UInt]], program: Option[Vec[UInt]], host: UInt, useProgram: Bool): Unit =
+    for (d <- dst; p <- program; (di, pi) <- d.zip(p)) di := Mux(useProgram, pi, host)
+
+  // A buffer's write switch: the program's placement while running, the
+  // host's whole rows unmoved before start. `beat` = the write data is a
+  // numOutputs-lane beat zero-padded to the row; with the program's
+  // `partial` only its lanes are written.
+  private def connectWriteSwitch(words: Int, wmask: Vec[Bool], rotate: UInt, fanout: UInt, interleave: UInt,
+    ctrl: BufferWriteCtrl, beat: Bool): Unit = {
+    val running = decoder.io.running
+    for (i <- 0 until words)
+      wmask(i) := !(running && beat && ctrl.partial) || (i < cfg.cu.numOutputs).B
+    rotate := Mux(running, ctrl.rotate, 0.U)
+    fanout := Mux(running, ctrl.fanout, 0.U)
+    interleave := Mux(running, ctrl.interleave, 0.U)
+  }
+
   private val decoder = Module(new Decoder(cfg.decoder))
   decoder.io.start := io.start
   decoder.io.progWriteEn := io.progWriteEn
@@ -157,10 +177,13 @@ class Xccel(cfg: XccelConfig) extends Module {
   // read is dropped); OneR1W/TwoRW give each its own.
   private val wb = decoder.io.wbRead
   weightBuffer.io.readAddr := wb.addr
+  for (d <- weightBuffer.io.readGroupAddr; p <- wb.groupAddr) d := p
   weightBuffer.io.readEn := wb.en
   weightBuffer.io.writeAddr := Mux(decoder.io.running, decoder.io.wbWrite.addr, io.wbWriteAddr)
+  connectGroups(weightBuffer.io.writeGroupAddr, decoder.io.wbWrite.groupAddr, io.wbWriteAddr, decoder.io.running)
   weightBuffer.io.writeEn := Mux(decoder.io.running, decoder.io.wbWrite.en, io.wbWriteEn)
   // write data: the host's, the Requantizer output, or a Transposer column
+  private val wbBeat = WireDefault(false.B)
   if (cfg.weightFeedback) {
     val transposer = Module(new Transposer(cfg.cu.numOutputs, cfg.cu.weightWidth))
     transposer.io.capture := decoder.io.transposer.capture
@@ -172,11 +195,15 @@ class Xccel(cfg: XccelConfig) extends Module {
     val ww = decoder.io.wbWrite
     weightBuffer.io.wdata := Mux(decoder.io.running && ww.transposed, pad(transposer.io.out),
       Mux(decoder.io.running && ww.fromRequantizer, pad(post.bits), io.wbWriteData))
+    wbBeat := ww.transposed || ww.fromRequantizer
   } else {
     weightBuffer.io.wdata := io.wbWriteData
   }
+  connectWriteSwitch(cfg.weightBuffer.totalWordsPerRow, weightBuffer.io.wmask, weightBuffer.io.writeRotate,
+    weightBuffer.io.writeFanout, weightBuffer.io.writeInterleave, decoder.io.wbWrite, wbBeat)
   weightBuffer.io.rotate := wb.rotate
   weightBuffer.io.fanout := wb.fanout
+  weightBuffer.io.interleave := wb.interleave
 
   // the weight port has no valid of its own: its strobe and row address
   // come straight from the program's weightPort slot
@@ -190,21 +217,28 @@ class Xccel(cfg: XccelConfig) extends Module {
   // connect into the compute unit (shapes match exactly)
   private val ab = decoder.io.abRead
   activationBuffer.io.readAddr := ab.addr
+  for (d <- activationBuffer.io.readGroupAddr; p <- ab.groupAddr) d := p
   activationBuffer.io.readEn := ab.en
   activationBuffer.io.writeAddr := Mux(decoder.io.running, decoder.io.abWrite.addr, io.abWriteAddr)
+  connectGroups(activationBuffer.io.writeGroupAddr, decoder.io.abWrite.groupAddr, io.abWriteAddr, decoder.io.running)
   activationBuffer.io.writeEn := Mux(decoder.io.running, decoder.io.abWrite.en, io.abWriteEn)
   // write data: the host's, or the Requantizer output (layer-to-layer path)
   // when the program's abWrite slot asks for it
+  private val abBeat = WireDefault(false.B)
   if (cfg.feedback) {
     val fromRequantizer = VecInit(Seq.tabulate(cfg.activationBuffer.totalWordsPerRow)(i =>
       if (i < cfg.cu.numOutputs) post.bits(i) else 0.U(cfg.cu.inputWidth.W)))
     activationBuffer.io.wdata :=
       Mux(decoder.io.running && decoder.io.abWrite.fromRequantizer, fromRequantizer, io.abWriteData)
+    abBeat := decoder.io.abWrite.fromRequantizer
   } else {
     activationBuffer.io.wdata := io.abWriteData
   }
+  connectWriteSwitch(cfg.activationBuffer.totalWordsPerRow, activationBuffer.io.wmask, activationBuffer.io.writeRotate,
+    activationBuffer.io.writeFanout, activationBuffer.io.writeInterleave, decoder.io.abWrite, abBeat)
   activationBuffer.io.rotate := ab.rotate
   activationBuffer.io.fanout := ab.fanout
+  activationBuffer.io.interleave := ab.interleave
   // activationBuffer.io.shiftIn := ab.shiftIn // line buffer disabled (accumulating kn2row)
 
   // a beat the program routes to the residual scaler never enters the array
@@ -229,14 +263,20 @@ class Xccel(cfg: XccelConfig) extends Module {
     accumulator.io.resultIn <> compute.io.resultOut
   }
   accumulator.io.writeAddr := decoder.io.accWrite.addr
+  for (d <- accumulator.io.writeGroupAddr; p <- decoder.io.accWrite.groupAddr) d := p
+  accumulator.io.writeRotate := decoder.io.accWrite.rotate
+  accumulator.io.writeFanout := decoder.io.accWrite.fanout
+  accumulator.io.writeInterleave := decoder.io.accWrite.interleave
   accumulator.io.accumulate := decoder.io.accWrite.accumulate
 
   // -- drain: the program's accRead slot, otherwise the host
   private val acc = decoder.io.accRead
   accumulator.io.readAddr := Mux(acc.en, acc.addr, io.accReadAddr)
+  connectGroups(accumulator.io.readGroupAddr, acc.groupAddr, io.accReadAddr, acc.en)
   accumulator.io.readEn := acc.en || io.accReadEn
   accumulator.io.rotate := Mux(acc.en, acc.rotate, 0.U)
   accumulator.io.fanout := Mux(acc.en, acc.fanout, 0.U)
+  accumulator.io.interleave := Mux(acc.en, acc.interleave, 0.U)
 
   requantizer.io.in <> accumulator.io.accOut
   requantizer.io.paramSet := Mux(decoder.io.running, decoder.io.requantParamSet, io.accReadParamSet)

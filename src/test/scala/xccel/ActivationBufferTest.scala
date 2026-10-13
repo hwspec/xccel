@@ -41,8 +41,14 @@ class ActivationBufferSystolicHarness(
   activationBuffer.io.writeAddr := io.abAddr
   activationBuffer.io.writeEn := io.abEn && io.abWen
   activationBuffer.io.wdata := io.abWdata
+  // whole rows, unmoved
+  activationBuffer.io.wmask.foreach(_ := true.B)
+  activationBuffer.io.writeRotate := 0.U
+  activationBuffer.io.writeFanout := 0.U
+  activationBuffer.io.writeInterleave := 0.U
   activationBuffer.io.rotate := io.abRotate
   activationBuffer.io.fanout := io.abFanout
+  activationBuffer.io.interleave := 0.U // grouped multicast only
   // activationBuffer.io.shiftIn := io.abShiftIn
 
   compute.weightWriteAddr := io.weightWriteAddr
@@ -74,6 +80,7 @@ class ActivationBufferTest extends AnyFlatSpec with ChiselScalatestTester {
       for ((s, r) <- samples.zipWithIndex) {
         c.io.writeAddr.poke(r.U)
         c.io.writeEn.poke(true.B)
+        c.io.wmask.foreach(_.poke(true.B))
         for ((v, i) <- s.zipWithIndex) c.io.wdata(i).poke(v.U)
         c.clock.step()
       }
@@ -106,6 +113,7 @@ class ActivationBufferTest extends AnyFlatSpec with ChiselScalatestTester {
       for ((s, r) <- samples.zipWithIndex) {
         c.io.writeAddr.poke(r.U)
         c.io.writeEn.poke(true.B)
+        c.io.wmask.foreach(_.poke(true.B))
         for ((v, i) <- s.zipWithIndex) c.io.wdata(i).poke(v.U)
         c.clock.step()
       }
@@ -141,6 +149,7 @@ class ActivationBufferTest extends AnyFlatSpec with ChiselScalatestTester {
       for (r <- 0 until cfg.depth) {
         c.io.writeAddr.poke(r.U)
         c.io.writeEn.poke(true.B)
+        c.io.wmask.foreach(_.poke(true.B))
         val packed = groupA(r) ++ groupB(r) ++ groupC(r)
         for ((v, word) <- packed.zipWithIndex) c.io.wdata(word).poke(v.U)
         c.clock.step()
@@ -177,6 +186,7 @@ class ActivationBufferTest extends AnyFlatSpec with ChiselScalatestTester {
 
       c.io.writeAddr.poke(0.U)
       c.io.writeEn.poke(true.B)
+      c.io.wmask.foreach(_.poke(true.B))
       for ((v, i) <- sample.zipWithIndex) c.io.wdata(i).poke(v.U)
       c.clock.step()
       c.io.readEn.poke(false.B)
@@ -209,6 +219,7 @@ class ActivationBufferTest extends AnyFlatSpec with ChiselScalatestTester {
 
       c.io.writeAddr.poke(0.U)
       c.io.writeEn.poke(true.B)
+      c.io.wmask.foreach(_.poke(true.B))
       for ((v, i) <- sample.zipWithIndex) c.io.wdata(i).poke(v.U)
       c.clock.step()
       c.io.readEn.poke(false.B)
@@ -403,4 +414,128 @@ class ActivationBufferTest extends AnyFlatSpec with ChiselScalatestTester {
   //     Seq(3, 4, 30, 40).zipWithIndex.foreach { case (v, i) => c.io.operandOut.bits(i).expect(v.U) }
   //   }
   // }
+
+  "ActivationBuffer with address groups" should "gather a beat from, and scatter a write to, a different row per group" in {
+    val cuCfg = ComputeUnitConfig(numInputs = 4, numOutputs = 1, inputWidth = 8, weightWidth = 8, outputWidth = 20)
+    // banks 0-1 are group 0 (readAddr / writeAddr), banks 2-3 group 1
+    val cfg = ActivationBufferConfig(cuCfg, numBanks = 4, wordsPerBank = 1, depth = 4,
+      readLatency = 2, writeLatency = 2, portType = BankPortType.OneR1W, addrGroups = 2)
+    test(new ActivationBuffer(cfg)) { c =>
+      val rg = c.io.readGroupAddr.get(0)
+      val wg = c.io.writeGroupAddr.get(0)
+      c.io.rotate.poke(0.U)
+      c.io.fanout.poke(0.U)
+      c.io.readEn.poke(false.B)
+
+      def write(a0: Int, a1: Int, s: Seq[Int]): Unit = {
+        c.io.writeAddr.poke(a0.U)
+        wg.poke(a1.U)
+        c.io.writeEn.poke(true.B)
+        c.io.wmask.foreach(_.poke(true.B))
+        for ((v, i) <- s.zipWithIndex) c.io.wdata(i).poke(v.U)
+        c.clock.step()
+        c.io.writeEn.poke(false.B)
+      }
+      def read(a0: Int, a1: Int, expected: Seq[Int]): Unit = {
+        c.io.readAddr.poke(a0.U)
+        rg.poke(a1.U)
+        c.io.readEn.poke(true.B)
+        c.clock.step()
+        c.io.readEn.poke(false.B)
+        c.clock.step(cfg.readLatency - 1)
+        c.io.operandOut.valid.expect(true.B)
+        for ((v, i) <- expected.zipWithIndex) c.io.operandOut.bits(i).expect(v.U)
+      }
+
+      // whole rows: both groups at the same row
+      for ((s, r) <- Seq(Seq(10, 11, 12, 13), Seq(20, 21, 22, 23), Seq(30, 31, 32, 33)).zipWithIndex) write(r, r, s)
+      c.clock.step(cfg.writeLatency)
+      read(0, 2, Seq(10, 11, 32, 33))
+      read(2, 1, Seq(30, 31, 22, 23))
+
+      // scatter: banks 0-1 to row 3, banks 2-3 to row 0
+      write(3, 0, Seq(40, 41, 42, 43))
+      c.clock.step(cfg.writeLatency)
+      read(0, 0, Seq(10, 11, 42, 43))
+      read(3, 1, Seq(40, 41, 22, 23))
+    }
+  }
+
+  "ActivationBuffer" should "interleave a multicast, the select delayed with the read" in {
+    val cuCfg = ComputeUnitConfig(numInputs = 4, numOutputs = 1, inputWidth = 8, weightWidth = 8, outputWidth = 20)
+    val cfg = ActivationBufferConfig(cuCfg, numBanks = 4, wordsPerBank = 1, depth = 2, readLatency = 2, writeLatency = 2)
+    test(new ActivationBuffer(cfg)) { c =>
+      c.io.writeAddr.poke(0.U)
+      c.io.writeEn.poke(true.B)
+      c.io.wmask.foreach(_.poke(true.B))
+      for (i <- 0 until 4) c.io.wdata(i).poke((10 + i).U)
+      c.clock.step()
+      c.io.writeEn.poke(false.B)
+      c.clock.step(cfg.writeLatency)
+
+      c.io.readAddr.poke(0.U)
+      c.io.readEn.poke(true.B)
+      c.io.rotate.poke(0.U)
+      c.io.fanout.poke(1.U)
+      c.io.interleave.poke(1.U)
+      c.clock.step()
+      // a later select must not affect the beat in flight
+      c.io.readEn.poke(false.B)
+      c.io.interleave.poke(0.U)
+      c.clock.step(cfg.readLatency - 1)
+      c.io.operandOut.valid.expect(true.B)
+      for ((v, j) <- Seq(10, 11, 10, 11).zipWithIndex) c.io.operandOut.bits(j).expect(v.U)
+    }
+  }
+
+  "ActivationBuffer with a write switch" should "place a narrow write anywhere in the row, writing only its words" in {
+    val cuCfg = ComputeUnitConfig(numInputs = 4, numOutputs = 1, inputWidth = 8, weightWidth = 8, outputWidth = 20)
+    val cfg = ActivationBufferConfig(cuCfg, numBanks = 4, wordsPerBank = 1, depth = 2, readLatency = 2, writeLatency = 2,
+      portType = BankPortType.OneR1W)
+    test(new ActivationBuffer(cfg)) { c =>
+      c.io.readEn.poke(false.B)
+      c.io.rotate.poke(0.U)
+      c.io.fanout.poke(0.U)
+      c.io.interleave.poke(0.U)
+
+      // a 2-word write (words 0-1 of wdata carry data) at word `at`
+      def write(s: Seq[Int], mask: Seq[Boolean], at: Int, fanout: Int = 0, interleave: Int = 0): Unit = {
+        c.io.writeAddr.poke(0.U)
+        c.io.writeEn.poke(true.B)
+        for (i <- 0 until 4) {
+          c.io.wdata(i).poke(s(i).U)
+          c.io.wmask(i).poke(mask(i).B)
+        }
+        c.io.writeRotate.poke(((4 - at) % 4).U)
+        c.io.writeFanout.poke(fanout.U)
+        c.io.writeInterleave.poke(interleave.U)
+        c.clock.step()
+        c.io.writeEn.poke(false.B)
+        c.clock.step(cfg.writeLatency)
+      }
+      def row(expected: Seq[Int]): Unit = {
+        c.io.readAddr.poke(0.U)
+        c.io.readEn.poke(true.B)
+        c.clock.step()
+        c.io.readEn.poke(false.B)
+        c.clock.step(cfg.readLatency - 1)
+        for ((v, i) <- expected.zipWithIndex) c.io.operandOut.bits(i).expect(v.U)
+      }
+      val beat = Seq(true, true, false, false)
+
+      write(Seq(1, 2, 3, 4), Seq.fill(4)(true), at = 0)
+      row(Seq(1, 2, 3, 4))
+      write(Seq(9, 8, 0, 0), beat, at = 2)
+      row(Seq(1, 2, 9, 8))
+      // across the row end: words 3, 0
+      write(Seq(7, 6, 0, 0), beat, at = 3)
+      row(Seq(6, 2, 9, 7))
+      // a 2-word tile replicated over the row
+      write(Seq(5, 4, 0, 0), beat, at = 0, fanout = 1, interleave = 1)
+      row(Seq(5, 4, 5, 4))
+      // without a mask the zero padding is written too
+      write(Seq(3, 3, 0, 0), Seq.fill(4)(true), at = 1)
+      row(Seq(0, 3, 3, 0))
+    }
+  }
 }

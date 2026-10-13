@@ -18,8 +18,12 @@ case class ActivationBufferConfig(
   // largest LaneSwitch fanout built (see LaneSwitchConfig): None = up to
   // broadcast, Some(0) = unicast only
   maxFanout: Option[Int] = None,
+  // independent row addresses, one per run of numBanks / addrGroups
+  // consecutive banks (see AddrGroups); 1 = all banks share one address
+  addrGroups: Int = 1,
 ) {
   require(depth > 0, "depth must be positive")
+  AddrGroups.validate(numBanks, addrGroups)
   require(wordsPerBank > 0, "wordsPerBank must be positive")
   // require(windowDepth > 0, "windowDepth must be positive")
   // require(
@@ -49,18 +53,40 @@ case class ActivationBufferConfig(
     laneWidth = cu.inputWidth,
     maxFanout = maxFanout,
   )
+  // write side: a write's words -> the row's words. The same switch routes
+  // each word's write enable (wmask), so only the words the data lands on
+  // are written and the others keep their value: a beat narrower than the
+  // row (e.g. a Requantizer beat) can be placed anywhere in it. wdata word i
+  // lands on word (i - rotate) mod totalWordsPerRow.
+  val writeSwitch: LaneSwitchConfig = LaneSwitchConfig(
+    numIn = totalWordsPerRow,
+    numOut = totalWordsPerRow,
+    inPerOut = 1,
+    laneWidth = cu.inputWidth,
+    maxFanout = maxFanout,
+  )
+
 }
 
 class ActivationBufferIO(cfg: ActivationBufferConfig) extends Bundle {
   // read stream (the program) and write stream (host / other source);
   // how they map onto SRAM ports depends on cfg.portType (Sram.connectReadWrite)
+  // group 0's row address, then groups 1 .. addrGroups-1 (AddrGroups)
   val readAddr = Input(UInt(cfg.sram.addrWidth.W))
+  val readGroupAddr = AddrGroups.extra(cfg.addrGroups, UInt(cfg.sram.addrWidth.W)).map(Input(_))
   val readEn = Input(Bool())
   val writeAddr = Input(UInt(cfg.sram.addrWidth.W))
+  val writeGroupAddr = AddrGroups.extra(cfg.addrGroups, UInt(cfg.sram.addrWidth.W)).map(Input(_))
   val writeEn = Input(Bool())
   val wdata = Input(Vec(cfg.totalWordsPerRow, UInt(cfg.cu.inputWidth.W)))
+  // which wdata words carry data (before the write switch)
+  val wmask = Input(Vec(cfg.totalWordsPerRow, Bool()))
+  val writeRotate = Input(UInt(cfg.writeSwitch.rotateWidth.W))
+  val writeFanout = Input(UInt(cfg.writeSwitch.fanoutWidth.W))
+  val writeInterleave = Input(UInt(cfg.writeSwitch.interleaveWidth.W))
   val rotate = Input(UInt(cfg.laneSwitch.rotateWidth.W))
   val fanout = Input(UInt(cfg.laneSwitch.fanoutWidth.W))
+  val interleave = Input(UInt(cfg.laneSwitch.interleaveWidth.W))
   // Line buffer disabled: im2col is done by accumulating kn2row instead (one
   // 1x1 pass per kernel position, partial sums added in Accumulator). Kept
   // commented out for reference.
@@ -83,16 +109,23 @@ class ActivationBuffer(cfg: ActivationBufferConfig) extends Module {
   private def wordSlice(row: UInt, i: Int): UInt =
     row((i + 1) * cfg.cu.inputWidth - 1, i * cfg.cu.inputWidth)
 
+  // the write's words and their enables, routed onto the row
+  private val routed =
+    LaneSwitch.connect(cfg.writeSwitch, io.wdata, io.writeRotate, io.writeFanout, io.writeInterleave)
+  private val routedMask = LaneSwitch.connect(cfg.writeSwitch.copy(laneWidth = 1), VecInit(io.wmask.map(_.asUInt)),
+    io.writeRotate, io.writeFanout, io.writeInterleave)
+
   // pack each bank's wordsPerBank words (word 0 = LSBs) into one row
   private val rdata = Sram.connectReadWrite(
     cfg.sram,
     sram.io,
-    io.readAddr,
+    AddrGroups.perBank(AddrGroups.all(io.readAddr, io.readGroupAddr), cfg.numBanks),
     io.readEn,
-    io.writeAddr,
+    AddrGroups.perBank(AddrGroups.all(io.writeAddr, io.writeGroupAddr), cfg.numBanks),
     io.writeEn,
-    Seq.tabulate(cfg.numBanks)(n => Cat((0 until cfg.wordsPerBank).reverse.map(i => io.wdata(n * cfg.wordsPerBank + i)))),
-    Seq.fill(cfg.numBanks)(cfg.sram.fullMask),
+    Seq.tabulate(cfg.numBanks)(n => Cat((0 until cfg.wordsPerBank).reverse.map(i => routed(n * cfg.wordsPerBank + i)))),
+    // one mask bit per word (maskGranularity = the word width)
+    Seq.tabulate(cfg.numBanks)(n => Cat((0 until cfg.wordsPerBank).reverse.map(i => routedMask(n * cfg.wordsPerBank + i)))),
   )
 
   private val flatWords = VecInit((0 until cfg.numBanks).flatMap { n =>
@@ -102,6 +135,8 @@ class ActivationBuffer(cfg: ActivationBufferConfig) extends Module {
   private val rotatePipe = ShiftRegister(io.rotate, cfg.readLatency, 0.U(cfg.laneSwitch.rotateWidth.W), true.B)
   private val fanoutPipe =
     ShiftRegister(io.fanout, cfg.readLatency, 0.U(cfg.laneSwitch.fanoutWidth.W), true.B)
+  private val interleavePipe =
+    ShiftRegister(io.interleave, cfg.readLatency, 0.U(cfg.laneSwitch.interleaveWidth.W), true.B)
 
   io.operandOut.valid := ShiftRegister(io.readEn, cfg.readLatency, false.B, true.B)
 
@@ -123,6 +158,6 @@ class ActivationBuffer(cfg: ActivationBufferConfig) extends Module {
   // }
 
   // io.operandOut.bits :=
-  //   VecInit(rows.flatMap(row => LaneSwitch.connect(cfg.laneSwitch, row, rotatePipe, fanoutPipe).toSeq))
-  io.operandOut.bits := LaneSwitch.connect(cfg.laneSwitch, flatWords, rotatePipe, fanoutPipe)
+  //   VecInit(rows.flatMap(row => LaneSwitch.connect(cfg.laneSwitch, row, rotatePipe, fanoutPipe, interleavePipe).toSeq))
+  io.operandOut.bits := LaneSwitch.connect(cfg.laneSwitch, flatWords, rotatePipe, fanoutPipe, interleavePipe)
 }

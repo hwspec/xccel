@@ -188,4 +188,66 @@ class DecoderTest extends AnyFlatSpec with ChiselScalatestTester {
       }
     }
   }
+
+  it should "advance every address group's row by its own stride, in reads and writes, and pass the switch controls" in {
+    val cfg = DecoderConfig(wbCfg.copy(addrGroups = 2), abCfg.copy(addrGroups = 4), accCfg.copy(addrGroups = 2),
+      programLength = 2, maxRunLength = 2)
+    test(new Decoder(cfg)) { c =>
+      val p = loader(c)
+      val abW = cfg.activationBuffer.sram.addrWidth
+      p.word(cycles = 2, halt = true) { w =>
+        w.wbRead.en.poke(true.B)
+        w.wbRead.addr.poke(1.U)
+        w.wbRead.addrStride.poke(1.U)
+        w.wbRead.groupAddr.get(0).addr.poke(3.U)
+        w.wbRead.groupAddr.get(0).addrStride.poke(MicroProgramLoader.minusOne(wbCfg.sram.addrWidth))
+        w.wbWrite.en.poke(true.B)
+        w.wbWrite.addr.poke(0.U)
+        w.wbWrite.groupAddr.get(0).addr.poke(2.U)
+        w.abRead.en.poke(true.B)
+        for (g <- 0 until 3) {
+          w.abRead.groupAddr.get(g).addr.poke((2 * g + 2).U)
+          w.abRead.groupAddr.get(g).addrStride.poke((g + 1).U)
+        }
+        w.abWrite.en.poke(true.B)
+        w.abWrite.groupAddr.get(2).addr.poke(7.U)
+        w.abWrite.groupAddr.get(2).addrStride.poke(MicroProgramLoader.minusOne(abW))
+        w.accRead.en.poke(true.B)
+        w.accRead.fanout.poke(1.U)
+        w.accRead.interleave.poke(1.U)
+        w.accRead.groupAddr.get(0).addr.poke(1.U)
+        w.accRead.groupAddr.get(0).addrStride.poke(2.U)
+        w.accWrite.addr.poke(3.U)
+        w.accWrite.groupAddr.get(0).addr.poke(2.U)
+        w.accWrite.groupAddr.get(0).addrStride.poke(1.U)
+        w.accWrite.rotate.poke(1.U)
+        w.accWrite.rotateStride.poke(1.U)
+        w.accWrite.fanout.poke(1.U)
+        w.accWrite.interleave.poke(1.U)
+      }
+      p.done()
+
+      pulseStart(c)
+      for (i <- 0 until 2) {
+        c.io.wbRead.addr.expect((1 + i).U)
+        c.io.wbRead.groupAddr.get(0).expect((3 - i).U)
+        c.io.wbWrite.addr.expect(0.U)
+        c.io.wbWrite.groupAddr.get(0).expect(2.U)
+        c.io.abRead.addr.expect(0.U)
+        for (g <- 0 until 3) c.io.abRead.groupAddr.get(g).expect(((2 * g + 2 + (g + 1) * i) % 8).U)
+        c.io.abWrite.groupAddr.get(0).expect(0.U)
+        c.io.abWrite.groupAddr.get(2).expect((7 - i).U)
+        c.io.accRead.addr.expect(0.U)
+        c.io.accRead.interleave.expect(1.U)
+        c.io.accRead.groupAddr.get(0).expect(((1 + 2 * i) % 4).U)
+        c.io.accWrite.addr.expect(3.U)
+        c.io.accWrite.groupAddr.get(0).expect((2 + i).U)
+        c.io.accWrite.rotate.expect(((1 + i) % 2).U) // a 2-word row
+        c.io.accWrite.fanout.expect(1.U)
+        c.io.accWrite.interleave.expect(1.U)
+        c.clock.step()
+      }
+      c.io.running.expect(false.B)
+    }
+  }
 }
