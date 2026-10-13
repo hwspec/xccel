@@ -471,7 +471,7 @@ class AxiXccel(p: XccelModuleParams) extends chisel3.Module with axi.HasAxiLite3
 }
 
 // The configuration of the list-scheduled BraggNN program
-// (tests/braggnn_program_opt.py): two Accumulator row banks, four softmax
+// (gwtests/braggnn_program_opt.py): two Accumulator row banks, four softmax
 // rows in flight. Generated into generated/AxiXccelOpt/.
 class AxiXccelOpt(p: XccelModuleParams) extends AxiXccel(p)
 

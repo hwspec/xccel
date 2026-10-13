@@ -7,7 +7,7 @@ lazy val root = (project in file("."))
   .settings(
     name := "package",
 
-    // Include chisel-axi-utils Scala sources directly
+    // Include garageworks Scala sources directly
     Compile / unmanagedSourceDirectories +=
       baseDirectory.value / "garageworks" / "src" / "main" / "scala",
 

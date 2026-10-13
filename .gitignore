@@ -8,6 +8,6 @@ __pycache__/
 .xml
 .log
 generated/
-test/sim_build*
-tests/fpga_tb_*.py
-tests/fpga_xccel_bridge.py
+gwtests/sim_build*
+gwtests/fpga_tb_*.py
+gwtests/fpga_xccel_bridge.py

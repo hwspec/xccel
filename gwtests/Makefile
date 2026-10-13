@@ -4,9 +4,8 @@
 
 SIM ?= verilator
 TOPLEVEL_LANG ?= verilog
-TOPNAME=user_accel_bd_wrapper
-#HWMODULENAME=AxiXccelOpt9x64T
-HWMODULENAME=AxiXccel
+TOPNAME=wrapper
+HWMODULENAME ?= $(or $(shell sed -n 's/^name=//p' ../.gwconfig 2>/dev/null),AxiXccel)
 SRCDIR = $(abspath ../generated/$(HWMODULENAME))
 VERILOG_SOURCES += $(SRCDIR)/*.v $(SRCDIR)/*.sv
 
@@ -36,6 +35,15 @@ $(TARGETS) : $(SRCDIR)/$(HWMODULENAME).sv
 #   make braggnn_inference_opt HWMODULENAME=AxiXccelOpt9 SIM_BUILD=sim_build_opt9
 $(SRCDIR)/$(HWMODULENAME).sv gen:
 	(cd ../ ; sbt runMain xccel.$(HWMODULENAME))
+
+# FPGA (gwscript testhw): convert tb_<test>.py into a plain host script
+# (makefile.fpga, conv_cocotb_to_fpga) and run it on the board through
+# AVED_Bridge; PARAMFN points at params.json
+$(addprefix hw_,$(TARGETS)) : hw_% :
+	$(MAKE) -f makefile.fpga
+	rm -f output.log
+	python fpga_tb_$*.py
+	@cat output.log
 
 include $(shell cocotb-config --makefiles)/Makefile.sim
 
