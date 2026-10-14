@@ -36,16 +36,27 @@ $(TARGETS) : $(SRCDIR)/$(HWMODULENAME).sv
 $(SRCDIR)/$(HWMODULENAME).sv gen:
 	(cd ../ ; sbt runMain xccel.$(HWMODULENAME))
 
-# FPGA (gwscript testhw): convert tb_<test>.py into a plain host script
-# (makefile.fpga, conv_cocotb_to_fpga) and run it on the board through
-# AVED_Bridge; PARAMFN points at params.json
-$(addprefix hw_,$(TARGETS)) : hw_% :
-	$(MAKE) -f makefile.fpga
-	rm -f output.log
-	python fpga_tb_$*.py
+sim-all: $(TARGETS)
+hw-all: $(addprefix hw_,$(TARGETS))
+
+fpga_tb_%.py: tb_%.py $(BRIDGEBN).py
+	@conv_cocotb_to_fpga $^ --force
+
+.PRECIOUS: fpga_tb_%.py          # keep converted testbenches between runs
+
+hw_%: fpga_tb_%.py
+	@rm -f output.log
+	@PARAMFN=$(SRCDIR)/params.json python fpga_tb_$*.py
+	@printf '\n[Output]\n'
 	@cat output.log
 
+list:
+	@for t in $(TARGETS); do printf '%-14s hw_%s\n' $$t $$t; done
+
+NON_SIM_GOALS := hw_% fpga_tb_%.py list
+ifneq ($(if $(MAKECMDGOALS),$(filter-out $(NON_SIM_GOALS),$(MAKECMDGOALS)),sim),)
 include $(shell cocotb-config --makefiles)/Makefile.sim
+endif
 
 clean::
 	rm -f output.txt results.xml *.vcd fpga_simple.py
