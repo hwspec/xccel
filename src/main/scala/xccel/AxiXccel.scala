@@ -35,9 +35,9 @@
 
 package xccel
 
-import axi._
-import axi.AxiLiteResp._
-import axi.AxiModuleParamsHelper._
+import garageworks._
+import garageworks.AxiLiteResp._
+import garageworks.AxiModuleParamsHelper._
 import upickle.default._
 
 import chisel3._
@@ -249,7 +249,7 @@ object BitLayout {
   )
 }
 
-class AxiXccel(p: XccelModuleParams) extends chisel3.Module with axi.HasAxiLite32IO {
+class AxiXccel(p: XccelModuleParams) extends chisel3.Module with garageworks.HasAxiLite32IO {
   override val S = IO(new AxiLite32IO())
 
   private val cfg = p.xccelConfig

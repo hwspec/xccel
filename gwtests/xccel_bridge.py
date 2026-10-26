@@ -2,7 +2,7 @@ import json
 import os
 from pathlib import Path
 
-from axi_test_bridge.cocotb_bridge import COCOTB_Bridge
+from garageworks.bridge.cocotb_bridge import COCOTB_Bridge
 
 # ---------------------------------------------------------------------------
 # Status register bit masks (status_r)

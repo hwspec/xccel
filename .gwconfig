@@ -1,4 +1,4 @@
-name=AxiXccelOpt9
-package=xccel
-tests=braggnn_inference_opt
-fpgatest=false
+chiseltop=xccel.AxiXccel
+testdir=gwtests
+tests=braggnn_inference
+

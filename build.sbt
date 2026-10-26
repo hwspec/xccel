@@ -7,11 +7,10 @@ lazy val root = (project in file("."))
   .settings(
     name := "package",
 
-    // Include garageworks Scala sources directly
-    Compile / unmanagedSourceDirectories +=
-      baseDirectory.value / "garageworks" / "src" / "main" / "scala",
+    resolvers += "central-snapshots" at "https://central.sonatype.com/repository/maven-snapshots/",
 
     libraryDependencies ++= Seq(
+      "io.github.hwspec" %% "garageworks" % "0.4.0-SNAPSHOT",
       "org.chipsalliance" %% "chisel" % chiselVersion,
       "org.scalatest" %% "scalatest" % scalatestVersion % Test,
 
